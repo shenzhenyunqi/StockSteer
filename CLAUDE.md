@@ -29,7 +29,13 @@ pnpm db:down
 
 ## 边界(0 由 DB 权限兜底,1–4 由 eslint 硬拦)
 
-> CI 尚未搭(P0-T4 才做),现在这些门只在本地 `pnpm lint` / `pnpm db:verify` 生效。**别把「CI 会拦住」当既成事实**。
+> CI 已搭(`.github/workflows/ci.yml`:lint → typecheck → build → unit → integration 五段,push master + PR 触发)。日常在 `dev` 上做,PR 回 `master`。
+> **但「全绿才 merge」这道闸门还没配**:2026-08-20 实测远端既无 ruleset 也无 branch protection、required status check 一条都没有(`gh api …/rulesets` → `[]`、`…/branches` → `[]`、`…/branches/master/protection` → 404)。在有人去 GitHub 上把 `ci` 勾成 required check 之前,CI 只「会跑」不「会拦」——红着照样能 merge、也能直推。**别把「CI 会拦住」当既成事实**。
+> 各段的成色也不一样:**lint / typecheck / build 三段是活的门**(树里代码还极少,所以此刻拦得住的东西不多,但压力随代码增长自动加上来);`db:verify` 的 28 条权限断言是活的;**unit / integration 两段是空转的绿**——`--passWithNoTests` 让它们收集到 0 个测试也不红(CI 里为此挂 warning),golden tests 到 P1 才补。
+>
+> 两笔欠账(P0 的 DoD 缺口,别只活在 PR 描述里):
+> ① T4 spec 的验收「故意改坏 G1 期望被拦」**现在无法验**——G1 golden test 到 P1 才存在。延至 P1 首条 golden 落地后补验。
+> ② P1 第一条测试落地时,同步去掉 `package.json` 里两处 `--passWithNoTests`。否则测试文件从 30 个掉到 2 个是看不见的,CI 那条计数 warning 只在掉到 0 时才响。
 
 0. **DB 三身份,权限 fail-closed**。`migrator`(DDL)/ `app_runtime`(运行时)/ `app_purger`(只为 30 天物理删除而生:三张事件表的 SELECT+DELETE,别的一律没有)。
    **fail-closed**:`ALTER DEFAULT PRIVILEGES` 只给 `SELECT, INSERT`,新表天然 append-only;**可变表**要在自己的 migration 里显式 `GRANT UPDATE, DELETE`。漏写的表当场写不动——这是设计,不是 bug。运行时身份 `app_runtime` 永不持有事件表的 UPDATE/DELETE。

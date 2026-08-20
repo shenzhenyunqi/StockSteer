@@ -4,9 +4,8 @@
 #   本地:  pnpm db:verify
 #   CI  :  P0-T4 的 integration 段调同一份(07 §8「靠权限兜底,不靠纪律」的可执行兑现)
 #
-# 注:P0-T3 之后应另加一条断言,遍历真实事件表
-# (inventory_events / sales_events / stockout_observations)断言 has_table_privilege
-# ... 'UPDATE' = false。此处只能用探针表,因为那三张表要到 T3 才存在。
+# 注:大部分断言只能用探针表,因为真实事件表要到 P0-T3 才存在。末尾那段「事件表」
+# 断言是自激活的:三张表还不存在就 SKIP,T3 建表当天自己醒过来,不需要谁记得回来接线。
 set -uo pipefail
 
 # 主机名必须是 compose 服务名 `postgres`,**不能是 localhost**:官方镜像的 pg_hba.conf
@@ -137,6 +136,25 @@ out=$(run "$MIG" "$CASCADE_GUARD")
 [ "$out" = "1" ] && ok "上条断言非空转:造一个级联外键立刻被抓出" \
                  || bad "上条断言非空转" "造了级联外键却仍是 [$out]"
 run "$MIG" "DROP TABLE IF EXISTS _probe_child, _probe_parent CASCADE" >/dev/null
+
+echo "· 三张真实事件表(P0-T4 spec 点名要的那条;T3 建表当天自动生效)"
+# 上面那条全局断言刻意**不含 UPDATE/DELETE** —— 约十九张可变表合法持有它们,一并查会
+# 天天误报。代价是「三张事件表没有 UPDATE/DELETE」到此为止仍然没有任何东西在断言,
+# 而那正是 00-README 一票否决项 4 与 01 §1 共同压着的那条线。
+# TRUNCATE/REFERENCES/TRIGGER 也列上:给可变表批量放权时写成 `GRANT ALL` 会把它们
+# 一并带进来,而写错一次表名,两道防线都不响。
+# has_table_privilege 的多权限写法是**任一命中即 true**,所以期望值是 false。
+# 用 to_regclass 判存在:返回 NULL 就 SKIP(今天的情形),不必等谁记得回来加这几行。
+for t in inventory_events sales_events stockout_observations; do
+  if [ "$(run "$MIG" "select (to_regclass('public.$t') is not null)::text")" != "true" ]; then
+    printf '  SKIP  %s\n        表尚不存在(P0-T3 未落地),建表当天这条断言自动启用\n' "$t"
+    continue
+  fi
+  expect_eq "$MIG" \
+    "select has_table_privilege('app_runtime','public.$t','UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER')::text" \
+    "false" \
+    "$t:app_runtime 无 UPDATE/DELETE/TRUNCATE/REFERENCES/TRIGGER"
+done
 
 run "$MIG" "DROP TABLE IF EXISTS _probe_event, _probe_mutable CASCADE" >/dev/null
 echo
