@@ -1,0 +1,8 @@
+packages:
+  - packages/*
+  - apps/*
+  - tools/*
+
+# pnpm 10 默认拦截依赖的 postinstall;vite 的 esbuild 需要放行
+onlyBuiltDependencies:
+  - esbuild

@@ -1,0 +1,9 @@
+# specs 只活在本机(2026-08-19 共识:仓库 public,算式实现公开,规格不公开;备份自负)
+specs/
+
+.DS_Store
+node_modules/
+dist/
+.env
+.env.*
+*.tsbuildinfo

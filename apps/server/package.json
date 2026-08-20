@@ -1,0 +1,14 @@
+{
+  "name": "@stocksteer/server",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc -b"
+  },
+  "dependencies": {
+    "@stocksteer/contracts": "workspace:*",
+    "@stocksteer/core": "workspace:*"
+  }
+}
