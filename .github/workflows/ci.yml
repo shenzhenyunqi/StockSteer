@@ -85,6 +85,17 @@ jobs:
       - name: pnpm install
         run: pnpm install --frozen-lockfile
 
+      # prisma.config.ts 用 @prisma/config 的 `env()` 读连接串,**缺变量直接抛**
+      # (实测:连 `prisma generate` 都会以 exit 1 挂掉,不是只有 migrate 才需要)。
+      # 那个"抛"是故意的 —— Railway 的 preDeploy 继承 app service 的 env、没有
+      # per-command override,漏配必须当场炸,不能悄悄回落到超级用户串(P0-T5 坑③)。
+      # 代价是 CI 得自己把开发默认值摆上,而且要**早于 generate 那一步**。
+      # 用 .env.example 而不是在这里另写一份 env:两份连接串会漂,漂了本地才发现。
+      # 走 @127.0.0.1 是安全的 —— 宿主机进程经 docker-proxy 到达时源地址是 bridge
+      # 网关(非 loopback),命中 scram,口令真的被校验(下面 integration 段有实测记录)。
+      - name: 准备 .env(prisma.config.ts 缺变量会抛)
+        run: cp .env.example .env
+
       - name: 1/5 lint
         run: pnpm lint
 
@@ -138,6 +149,24 @@ jobs:
             '规则2 例外:infra 内可以 import 生成的 client' \
             "import { PrismaClient } from '../infra/prisma/generated/client.js'
           void PrismaClient"
+          # 规则 2 的第二个例外(P0-T3):prisma.config.ts 必须在仓库根 import prisma/config。
+          # 例外面是**精确文件名**,不是"根目录"—— 下面一红一绿把这个边界钉住。
+          assert_lint green prisma.config.ts \
+            '规则2 例外:prisma.config.ts 可以 import prisma/config' \
+            "import { defineConfig } from 'prisma/config'
+          export default defineConfig({})"
+          assert_lint red tools/track-a/src/x.ts \
+            '规则2 例外没有外溢:别的文件 import prisma 照样被拦' \
+            "import { defineConfig } from 'prisma/config'
+          void defineConfig"
+          # 规则 5(P0-T3):部分唯一索引的复合键在 client 里是**假的**唯一键
+          # (prisma#29282:findUnique 静默退化成 findFirst)。这条下不到 DB,只能靠 lint。
+          assert_lint red apps/server/src/infra/cards.ts \
+            '规则5:active-slot 的假唯一键被拦' \
+            "export const x = { where: { tenantId_productId_cardType_destChannel: { a: 1 } } }"
+          assert_lint green apps/server/src/infra/cards.ts \
+            '规则5 不误伤:正常的 findFirst 条件可以过' \
+            "export const x = { where: { tenantId: 't', productId: 'p', status: 'active' } }"
           # 规则 3:web 禁类型断言(接口类型一律从 contracts 推断)
           assert_lint red apps/web/src/x.ts \
             '规则3 web:类型断言被拦' \
@@ -158,7 +187,9 @@ jobs:
       # lint 绿 → 守卫红 → typecheck/build/unit/integration 全 skip → `db:verify` 一次
       # 都没跑 —— 而 spec 把 T4 提到 T3 之前的**唯一理由**,就是让 T3 手写二十条 GRANT 时
       # 两道防线都通电。硬门恰好会在最需要它的那一刻把总闸拉掉。
-      - name: Prisma generate(typecheck 前置;T3 落地当天自动启用)
+      # 2026-08-20 P0-T3 落地后此步骤已实打实在跑(命中 prisma/schema.prisma)。
+      # 探测式写法保留:schema 挪了位置也跑不掉,而写死路径的失败形态是"静默跳过"。
+      - name: Prisma generate(typecheck 前置;T3 起已实际生成)
         run: |
           set -o pipefail
           schemas=$(git ls-files '*.prisma')
@@ -237,7 +268,24 @@ jobs:
           # --wait 到 healthy 再往下走。healthcheck 带 -h 的理由见 docker-compose.yml:
           # 不带 -h 会在 initdb 跑完前就报 healthy,而 CI 空卷冷跑正是那个场景。
           pnpm db:up
+          # P0-T3:空卷冷跑 = 每次 CI 都在重放一遍全部 migration。T3 验收的
+          # 「migrate 干净重放」就是靠这一行持续兑现的,不是某个人本地跑过一次。
+          pnpm db:migrate
+          # 种子刻意跑在 **app_runtime** 身份下:它把每张可变表 upsert 一遍、
+          # 三张事件表 insert 一遍,等于把 migration 里那二十来条 GRANT 整体过一遍电。
+          # 漏写一条 GRANT 的后果因此是"CI 当场红",而不是"P1 某天写投影时才炸"。
+          # schema.prisma ↔ migrations 漂移守卫。没有它的话,「改了 schema 忘了生成
+          # migration」这条会**全程绿**:typecheck 绿(client 是从 schema 生成的)、
+          # build 绿、migrate deploy 绿(没有新 migration 要跑),然后运行时炸在缺列上。
+          # 拿**已迁移的真库**比 datamodel,所以不需要 shadow database
+          # (配 shadowDatabaseUrl 会让 migrate dev 要求那个库预先存在,实测 P1003)。
+          # 退出码:0 = 无差异,2 = 有差异,1 = 出错。本机实测非空转:给 schema 加一列 → 2。
+          pnpm exec prisma migrate diff --from-config-datasource --to-schema prisma/schema.prisma --exit-code \
+            || { echo "::error file=prisma/schema.prisma::schema.prisma 与已应用的 migration 不一致 —— 少跑了 pnpm db:migrate:dev?"; exit 1; }
+          pnpm db:seed
           # 07 §8「append-only 靠权限兜底、不靠纪律」的可执行兑现,和本地是同一份脚本。
+          # T3 起 db:verify 是两份:verify-roles.sh(权限模型)+ verify-schema.sh
+          # (真实表上的不变量:slot 唯一索引、卡行不可变、外键挡住级联、种子与 v7.4 默认值)。
           #
           # 这一步刻意不 export DATABASE_URL / MIGRATOR_DATABASE_URL / PURGER_DATABASE_URL,
           # 理由只有一条:`db:verify` 是 `docker compose exec` 在**容器内**执行的,宿主机的

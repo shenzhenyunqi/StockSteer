@@ -1,0 +1,26 @@
+# Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
+
+client_id = "31a46a1af7c7a3534921427cef8c540b"
+name = "StockSteer"
+application_url = "https://stocksteer-app.maxvideohub.com"
+embedded = false
+
+[build]
+# 联调期用 tunnel URL 覆盖上面的 application_url / redirect_urls。
+# P0-T5 Railway 上线后改为 false,否则本地一跑 dev 就把线上 App URL 冲掉。
+automatically_update_urls_on_dev = true
+
+[webhooks]
+api_version = "2026-07"
+
+[access_scopes]
+# Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
+scopes = "read_all_orders,read_inventory,read_locations,read_orders,read_products"
+optional_scopes = [ ]
+# 拍板 0(2026-08-20)= 独立形态。非嵌入应用必须走 authorization code grant,
+# 即 legacy install flow;托管安装(false)要求 token exchange,而 token exchange
+# 需要 App Bridge 的 session token,非嵌入下拿不到。两者不可混写。
+use_legacy_install_flow = true
+
+[auth]
+redirect_urls = [ "https://stocksteer-app.maxvideohub.com/auth/shopify/callback" ]

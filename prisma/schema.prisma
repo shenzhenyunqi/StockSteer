@@ -1,0 +1,834 @@
+// P0-T3 · Prisma schema v1
+//
+// 依据:01(领域/账本)· 02 §8(参数)· 04 §6(反馈)· 08 §3/§4(聚合与卡生命周期)· plan/p0 §0 + T3。
+//
+// ── 三条贯穿全表的硬约束(不是风格,是不变量)────────────────────────────────
+//
+// ① **timestamptz 而非 timestamp**。Prisma 对 PostgreSQL 的 DateTime 默认原生类型是
+//    `timestamp(3)`(**不带时区**)。归日按店铺时区换算(01 §1 / 02 §1 / golden V7)——
+//    落一个不带时区的列就等于把 UTC 偏移丢在写入侧,V7 永远对不上。故每一处显式写
+//    `@db.Timestamptz(3)`;日桶列(date)显式 `@db.Date`。
+//
+// ② **每一条外键都写死 `onDelete: Restrict, onUpdate: NoAction`,无例外**。
+//    Prisma 的默认是 `onUpdate: Cascade`(必填关系)与 `onDelete: SetNull`(可选关系)——
+//    两个默认都能穿透 append-only 墙:PG 的引用完整性触发器**以被引用表的权限执行、
+//    不看调用者**,`app_runtime` 对事件表没有 DELETE,却能靠删父行把事件行级联抹掉
+//    (p0 §0 第三轮复核 B3,已实测)。权限挡不住,只能在 referential action 上堵。
+//    代价是 purge 必须显式按序删——这正是 Restrict 的用意(T3 spec 原文)。
+//    `db/verify-roles.sh` 的 CASCADE_GUARD 会在每次 CI 上重新证明这条。
+//
+// ③ **append-only 表必须一次写对**。三张事件表(inventory_events / sales_events /
+//    stockout_observations)的列漏了就补不回来:历史行没法 UPDATE(权限上就不行),
+//    补列只能得到一片 NULL,而 90 天窗口正是靠这些历史行算出来的。可变表则相反,
+//    缺列后面加一条 migration 就是了。所以本文件对两类表用**两种松紧度**:
+//    事件表按"下游算式此刻已知需要什么"补齐(见 sales_events.order_ref),
+//    可变表严格按 YAGNI,不预留任何"以后可能要"的列。
+//
+// ④ **金额列一律无币种,因为一期只做单市场 US**(03 §2「单市场(US)起步」)。Shopify 的
+//    `unitCost` 实际是 MoneyV2(带 currencyCode),ACL 翻译时必须校验币种 = USD,不符进
+//    dead-letter —— 否则非 USD 店铺会静默混币。多市场那天再加 currency 列(可变表,不难)。
+//
+// ── 权限 ────────────────────────────────────────────────────────────────────
+// 默认权限 fail-closed(db/roles.sql):migrator 建的新表,app_runtime **天然只有
+// SELECT + INSERT**。可变表的 `GRANT UPDATE, DELETE` 与 app_purger 的三句授权全在
+// migration 里显式写(migrations/*/migration.sql 尾部的权限块),漏写的表当场写不动。
+
+generator client {
+  provider = "prisma-client"
+  output   = "../apps/server/src/infra/prisma/generated"
+
+  // 显式钉死而不靠推断:生成器会从 output 目录往上找 tsconfig 推断 module 形态,
+  // 推断错了 typecheck **不会红**(每个生成文件都戳 `// @ts-nocheck`),只在运行时炸。
+  // 我们是 NodeNext,ESM + 带 `.js` 后缀的相对 import 才解析得了(p0 §0)。
+  moduleFormat        = "esm"
+  importFileExtension = "js"
+
+  // 部分唯一索引(recommendation_cards 的 active-slot,08 §4)是 preview 特性。
+  previewFeatures = ["partialIndexes"]
+}
+
+datasource db {
+  provider = "postgresql"
+  // v7 起 `url` 不再允许出现在 schema 里(实测报错:"no longer supported in schema
+  // files")。连接串在 prisma.config.ts:CLI/migrate 走 MIGRATOR_DATABASE_URL,
+  // 运行时另走 new PrismaPg({ connectionString: DATABASE_URL })(p0 §0 五件套④⑤)。
+}
+
+// ============================================================================
+// 枚举
+// ============================================================================
+
+enum Channel {
+  DTC
+  FBA
+  FBM
+}
+
+enum InvKind {
+  snapshot
+  delta
+  correction
+}
+
+enum InvState {
+  sellable
+  reserved
+  inbound
+}
+
+enum SalesKind {
+  sale
+  cancellation
+}
+
+enum Source {
+  shopify_webhook
+  shopify_bulk
+  amazon_report
+  reconciliation
+  csv_import
+}
+
+enum MappingMethod {
+  EXACT
+  NORMALIZED
+  FUZZY
+}
+
+enum MappingStatus {
+  pending
+  confirmed
+  rejected
+}
+
+enum CardType {
+  MOVE_STOCK
+  MCF_POOL
+  SHARED_POOL
+  STOCKOUT_ETA
+}
+
+enum CardStatus {
+  active
+  adopted
+  ignored
+  superseded
+  withdrawn
+}
+
+enum FeedbackAction {
+  adopted
+  ignored
+  adjusted
+}
+
+enum Plan {
+  free
+}
+
+// ── 以下五个枚举 T3 spec 的枚举清单未列,但 01/02 把取值写成了字面量联合,
+//    落表就必须有类型。取值逐字取自 spec,不自创。
+
+/// 01 §2 auth_tokens.provider
+enum Provider {
+  shopify
+  amazon
+}
+
+/// 01 §2 pool_override('shared'|'separate')
+enum PoolKind {
+  shared
+  separate
+}
+
+/// 01 §2 cogs_source 三值里**可被存储**的两个。
+/// 'shopify' 不是一个存储值而是"没有 override 行"的那一档:02 §4 的链是
+/// Shopify unitCost → 手工覆盖 → CSV,解析结果由 core 算出,不落列(落了就会与
+/// product_overrides.cogs 的有无产生第二个真相)。
+enum CogsOverrideSource {
+  override
+  csv
+}
+
+/// 02 §8 Demand & velocity:加权 平权(默认)/ recent-weighted
+enum VelocityWeighting {
+  even
+  recent
+}
+
+/// 02 §4 优先级:margin-first(默认)/ cover-first
+enum MovePriority {
+  margin_first
+  cover_first
+}
+
+/// 02 §1 Promo Event 的范围:全部 / 指定 Products
+enum PromoScope {
+  all_products
+  selected_products
+}
+
+/// 01 §1 对账裁决。容忍带内外都出 verdict,是否在带内由 within_tolerance 单独记
+/// (06 R1:带内 2% 也给 "Amazon wins",但建议不受影响)。
+/// 超带裁决的**形态**仍是开放拍板项 1(≈9/1,P3-T6 前),定案后可能加值。
+enum ReconVerdict {
+  match
+  ledger_wins
+  platform_wins
+}
+
+/// 03 §3 Watchdog 盯的数据源。**刻意不复用 `Source`**:那是**事件溯源**枚举
+/// (含 reconciliation / csv_import 这种不是"数据源"的值),拿来当 Watchdog 主键会让
+/// 03 §2 的五份日报塌成一个 `amazon_report`——「哪份报告超期 >24h」就答不出来了,
+/// SQS 通知桥更是没有对应值。取值逐条取自 03 §1/§2/§3,不自创。
+enum WatchdogSource {
+  shopify_webhook
+  shopify_bulk
+  amazon_notifications
+  amazon_inventory_planning
+  amazon_all_orders
+  amazon_merchant_listings
+  amazon_fba_fees
+  amazon_shipments
+}
+
+/// 04 §5 最近发送记录;skipped = 无事日不发(策略待定,种子期 A/B)
+enum EmailSendStatus {
+  sent
+  failed
+  skipped
+}
+
+// ============================================================================
+// Tenancy(横切,08 §2)
+// ============================================================================
+
+/// 租户 = 1 个 Shopify 店(01 §5)。
+/// `createdAt` 同时充当**安装日**:02 §1 的断货日剔除对 DTC/FBM 是"自安装日起可剔",
+/// 归因里那句口径不对称就是拿它算的。
+model Tenant {
+  id            String    @id
+  shopifyDomain String    @unique @map("shopify_domain")
+  /// IANA 时区(如 America/Los_Angeles)。全渠道时间戳换算到此再落日桶(01 §1)。
+  timezone      String
+  plan          Plan      @default(free)
+  /// 回填进度(04 §1 四步清单第 3 步);Shopify Bulk 的 objectCount
+  backfillObjectCount Int? @map("backfill_object_count")
+  /// 卸载时间。30 天物理删除的起算点(07 §3),没有它 purge 无从判断到期(拍板点⑥)。
+  uninstalledAt DateTime? @map("uninstalled_at") @db.Timestamptz(3)
+  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt     DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  authTokens            AuthToken[]
+  products              Product[]
+  productOverrides      ProductOverride[]
+  channelListings       ChannelListing[]
+  skuMappings           SkuMapping[]
+  params                Params?
+  promoEvents           PromoEvent[]
+  promoEventProducts    PromoEventProduct[]
+  inventoryEvents       InventoryEvent[]
+  salesEvents           SalesEvent[]
+  stockoutObservations  StockoutObservation[]
+  stockProjections      StockProjection[]
+  dailyUnits            DailyUnits[]
+  shopifyLocationLevels ShopifyLocationLevel[]
+  reconciliationRuns    ReconciliationRun[]
+  reconciliationRows    ReconciliationRow[]
+  engineRuns            EngineRun[]
+  recommendationCards   RecommendationCard[]
+  feedback              RecommendationFeedback[]
+  emailRecipients       EmailRecipient[]
+  emailSends            EmailSend[]
+  sourceStatuses        SourceStatus[]
+  deadLetters           DeadLetter[]
+
+  @@map("tenants")
+}
+
+/// Shopify offline token / Amazon refresh token,应用层对称加密后落库(07 §4/§8)。
+model AuthToken {
+  id         String   @id
+  tenantId   String   @map("tenant_id")
+  provider   Provider
+  ciphertext String
+  /// 轮换用:新密钥加密新数据,旧密钥保留解密(07 §8)
+  keyVersion Int      @map("key_version")
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt  DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@unique([tenantId, provider])
+  @@map("auth_tokens")
+}
+
+// ============================================================================
+// Catalog 商品身份(01 §2,08 §2)
+// ============================================================================
+
+/// Product 是**内部代理主键**,SKU 码只是展示属性(01 §2)。
+///
+/// 手工值与同步值分家(08 §5「手工值永不被自动改写」靠类型不靠自觉):
+///   · `cogsSynced` = Shopify unitCost,连接器 syncUpsert 写(02 §4 成本链第一档)
+///   · `paused` 与全部 per-SKU override 是手工值,syncUpsert 的参数类型里根本没有
+///   · 六项 override 全在 product_overrides(见该表注释里对 spec 矛盾的裁决)
+model Product {
+  id         String   @id
+  tenantId   String   @map("tenant_id")
+  displaySku String   @map("display_sku")
+  title      String
+  /// 02 §4 成本链第一档(Shopify unitCost)。空值永不覆盖实值。
+  cogsSynced Decimal? @map("cogs_synced") @db.Decimal(12, 2)
+  /// 02 §8:paused SKU 完全退出建议。手工列。
+  paused     Boolean  @default(false)
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt  DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+
+  override             ProductOverride?
+  channelListings      ChannelListing[]
+  inventoryEvents      InventoryEvent[]
+  salesEvents          SalesEvent[]
+  stockoutObservations StockoutObservation[]
+  stockProjections     StockProjection[]
+  dailyUnits           DailyUnits[]
+  promoEventProducts   PromoEventProduct[]
+  recommendationCards  RecommendationCard[]
+  reconciliationRows   ReconciliationRow[]
+
+  @@index([tenantId, displaySku])
+  @@map("products")
+}
+
+/// per-SKU override(02 §8 / 04 §7 / 09 `GET,PUT /api/products/:id/overrides`)。
+/// **全可空 = 继承**;手工值永不被同步改写。
+///
+/// ⚠ 与 spec 的偏差(T3 内部矛盾,须裁决之处):p0 §0 T3 表同时写了
+/// 「products = 01 §2 全列(手工列:cogs_override/pool_override/paused)」与
+/// 「product_overrides = cover/safety/lead/case_pack/**cogs/pool**」——同一个数字
+/// 被安排了两个家。这里裁决为**六项统一住在本表**:04 的 override 表就是六列、
+/// 09 的 /overrides 就是六项,两个家迟早会分叉。products 只留 paused 与 cogsSynced。
+model ProductOverride {
+  id        String   @id
+  tenantId  String   @map("tenant_id")
+  /// 单列 @unique 而非 @@unique([tenant, product]):Product 是 ULID 全局唯一,
+  /// 单列唯一严格强于 spec 的 UNIQUE(tenant, product),且 1-1 关系要求定义侧单列唯一。
+  productId String   @unique @map("product_id")
+
+  coverDays  Int?                @map("cover_days")
+  safetyDays Int?                @map("safety_days")
+  leadDays   Int?                @map("lead_days")
+  casePack   Int?                @map("case_pack")
+  cogs       Decimal?            @db.Decimal(12, 2)
+  /// 这条 cogs 是手工录的还是 CSV 导的。P1-T5:COGS CSV「时间戳新者胜、永不覆盖
+  /// 更新的手工单条改动」——没有 provenance + 时间戳这条规则无从实现。
+  cogsSource CogsOverrideSource? @map("cogs_source")
+  cogsUpdatedAt DateTime?        @map("cogs_updated_at") @db.Timestamptz(3)
+  /// 01 §4:同池手工覆盖,永不被自动改写
+  pool       PoolKind?
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  tenant  Tenant  @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  product Product @relation(fields: [productId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@map("product_overrides")
+}
+
+/// 挂牌(01 §2)。Shopify 多 location 聚合为单一 DTC,故 DTC 一个 Product 一行。
+model ChannelListing {
+  id         String   @id
+  tenantId   String   @map("tenant_id")
+  productId  String   @map("product_id")
+  channel    Channel
+  /// variant_id(Shopify)| seller_sku(Amazon)
+  externalId String   @map("external_id")
+  /// 缺口 3 的桥:`inventory_levels/update` 的 payload 是 location 级、只带
+  /// inventory_item_id,而 shopify_location_levels 里没有 product_id。没有这一列,
+  /// 「Σ 全 location → DTC snapshot 事件」这条主路径拿不到 product(p3 §T3/T4 明文
+  /// 要求回填时存在这张表上)。DTC 挂牌才有值。
+  inventoryItemId String? @map("inventory_item_id")
+  price      Decimal? @db.Decimal(12, 2)
+  listed     Boolean  @default(true)
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt  DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  tenant  Tenant  @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  product Product @relation(fields: [productId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+
+  mappingsAsShopify SkuMapping[] @relation("shopifyListing")
+  mappingsAsAmazon  SkuMapping[] @relation("amazonListing")
+
+  @@unique([tenantId, channel, externalId])
+  @@index([tenantId, inventoryItemId])
+  @@map("channel_listings")
+}
+
+/// 三级映射流水线(01 §2)。只有 EXACT 自动确认;未确认不进任何计算。
+model SkuMapping {
+  id                String        @id
+  tenantId          String        @map("tenant_id")
+  shopifyListingId  String        @map("shopify_listing_id")
+  amazonListingId   String        @map("amazon_listing_id")
+  method            MappingMethod
+  confidence        Decimal?      @db.Decimal(5, 4)
+  status            MappingStatus @default(pending)
+  decidedBy         String?       @map("decided_by")
+  decidedAt         DateTime?     @map("decided_at") @db.Timestamptz(3)
+  /// 缺口 6:Undo 只在**本次会话**内有效(08 §3 / 09 `POST /mappings/:id/undo`,
+  /// 过期 409)。没有这一列,"本次会话"无从判定。
+  decidedSession    String?       @map("decided_session")
+  createdAt         DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt         DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  tenant         Tenant         @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  shopifyListing ChannelListing @relation("shopifyListing", fields: [shopifyListingId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  amazonListing  ChannelListing @relation("amazonListing", fields: [amazonListingId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@unique([tenantId, shopifyListingId, amazonListingId])
+  @@map("sku_mappings")
+}
+
+// ============================================================================
+// Ledger 账本(01 §1,08 §2)—— 三张 append-only 表 + 两张投影
+// ============================================================================
+
+/// append-only。事件不可改写、不可删除;修正 = 追加 correction 事件(01 §1)。
+/// 兜底不在这层:`app_runtime` 对本表只有 SELECT + INSERT(默认权限 fail-closed),
+/// 且指向本表的一切外键与本表指出的一切外键都是 Restrict/NoAction。
+model InventoryEvent {
+  id         String   @id
+  tenantId   String   @map("tenant_id")
+  productId  String   @map("product_id")
+  channel    Channel
+  kind       InvKind
+  state      InvState
+  /// snapshot=绝对值;delta=增减;correction=对账修正后的绝对值(01 §1)
+  qty        Int
+  source     Source
+  /// webhook id / report id / 对账 id —— 幂等去重键的一部分
+  sourceRef  String   @map("source_ref")
+  /// 业务时间。投影按它折叠(L2/L3)
+  occurredAt DateTime @map("occurred_at") @db.Timestamptz(3)
+  /// 写入时间。同 occurred_at 时的 tie-break(P1-T2:occurred_at → recorded_at → id)
+  recordedAt DateTime @default(now()) @map("recorded_at") @db.Timestamptz(3)
+
+  tenant  Tenant  @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  product Product @relation(fields: [productId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+
+  correctedRows ReconciliationRow[]
+
+  /// L1 幂等:重复投递静默丢弃。store 层 UNIQUE 是第一道(P1-T2 的 fold 是第二道)。
+  /// ⚠ 01 §3 三态归一让**一条平台库存记录产出 3 条事件**(sellable/reserved/inbound),
+  /// 所以 source_ref 必须带 `:{state}`。漏了的话 reserved 与 inbound 永远进不了库,
+  /// 而 inbound 正是 02 §3.1 `gap = … − inbound_dst` 的输入(golden S1)。
+  @@unique([tenantId, source, sourceRef])
+  @@index([tenantId, productId, channel, occurredAt])
+  @@map("inventory_events")
+}
+
+/// append-only。kind=cancellation 时 qty 为负、occurred_at = **原订单下单时间**
+/// (01 §1 2026-08-20 裁决;重折叠自然从原日桶扣回)。
+model SalesEvent {
+  id         String    @id
+  tenantId   String    @map("tenant_id")
+  productId  String    @map("product_id")
+  channel    Channel
+  kind       SalesKind
+  /// 订单件数;取消为负(01 §1)
+  qty        Int
+  /// 订单标识。02 §4 的 DTC 自发货/MCF 折算是「$/order ÷ 尾随单均件数」,而
+  /// 单均件数 = 窗口内件数 ÷ **订单数** —— 没有这一列,订单数在事件流里算不出来。
+  /// 本表 append-only,列漏了补不回来(历史行只会是一片 NULL,而 90 天窗口正是
+  /// 靠历史行算的),所以在 T3 就补上,不等 P2 撞墙。
+  orderRef   String    @map("order_ref")
+  /// 02 §1「计入 = 非取消、**非测试订单**件数」。NULL = 计入;有值 = 不计入的原因
+  /// (如 `test_order`)。**照单全收 + 标记,而不是在 ACL 丢弃**(p0 §0 2026-08-20 裁决):
+  /// 丢弃是 append-only 表上的不可逆决定——判定错了历史行里没有任何证据可供重判,
+  /// 而 90 天窗口全靠历史行。与「取消」同构(取消也是追加负事件而非删原事件)。
+  /// 过滤只发生在 fold → daily_units 这**一个**点上,别在别处再滤一次。
+  excludedReason String? @map("excluded_reason")
+  source     Source
+  sourceRef  String    @map("source_ref")
+  occurredAt DateTime  @map("occurred_at") @db.Timestamptz(3)
+  recordedAt DateTime  @default(now()) @map("recorded_at") @db.Timestamptz(3)
+
+  tenant  Tenant  @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  product Product @relation(fields: [productId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+
+  /// L1 幂等。⚠ `source_ref` 必须对**每一条产出的事件**唯一:一张订单 N 个 line item →
+  /// N 条本表行,source_ref 少带 line item 维度就会被这条键**静默吞掉**后 N−1 条
+  /// (01 §1 规定重复投递静默丢弃,不报错)。约定见 plan/p3「source_ref 约定」。
+  @@unique([tenantId, source, sourceRef])
+  @@index([tenantId, productId, channel, occurredAt])
+  @@map("sales_events")
+}
+
+/// append-only。断货日自观测(02 §1 2026-08-20 裁决):每日 07:00 店铺时区单点采样,
+/// sellable=0 → 当天记一行。白天闪断、次日 07:00 前补上的不记(V6)。
+/// 重复采样靠 UNIQUE 四列 + `ON CONFLICT DO NOTHING` 吸收(只需 INSERT 权限)。
+model StockoutObservation {
+  id         String   @id
+  tenantId   String   @map("tenant_id")
+  productId  String   @map("product_id")
+  channel    Channel
+  /// 店铺时区的日期(01 §1「归日 = 店铺时区」)
+  date       DateTime @db.Date
+  recordedAt DateTime @default(now()) @map("recorded_at") @db.Timestamptz(3)
+
+  tenant  Tenant  @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  product Product @relation(fields: [productId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@unique([tenantId, productId, channel, date])
+  @@map("stockout_observations")
+}
+
+/// 投影 = 缓存,不是事实(01 §1)。迁移/修 bug 后直接删掉重算,不做投影级修补。
+/// 重算走 DELETE 不走 TRUNCATE(p0 §0:默认授予集里没有 TRUNCATE)。
+model StockProjection {
+  tenantId  String   @map("tenant_id")
+  productId String   @map("product_id")
+  channel   Channel
+  state     InvState
+  qty       Int
+  asOf      DateTime @map("as_of") @db.Timestamptz(3)
+
+  tenant  Tenant  @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  product Product @relation(fields: [productId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@id([tenantId, productId, channel, state])
+  @@map("stock_projection")
+}
+
+/// 销售侧投影:日粒度件数,供速度计算(01 §1)。桶键 = storeDay(occurred_at, 店铺tz)。
+model DailyUnits {
+  tenantId  String   @map("tenant_id")
+  productId String   @map("product_id")
+  channel   Channel
+  date      DateTime @db.Date
+  units     Int
+
+  tenant  Tenant  @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  product Product @relation(fields: [productId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@id([tenantId, productId, channel, date])
+  @@map("daily_units")
+}
+
+/// 缺口 3:`inventory_levels/update` 的 payload 是 **location 级**,而账本没有
+/// location 维度。这张表是连接器的聚合状态(**不是账本**):存住每个
+/// (location, inventory_item) 的最新值,Σ 全 location 才产出一条 DTC snapshot 事件。
+model ShopifyLocationLevel {
+  id              String   @id
+  tenantId        String   @map("tenant_id")
+  locationId      String   @map("location_id")
+  inventoryItemId String   @map("inventory_item_id")
+  /// Shopify 原词(available)。连接器状态表,平台语言到此为止(08 §6)。
+  /// **可空**:官方对该字段的定义是「returns null if the inventory item is not tracked」
+  /// ——未跟踪库存的 item 就是 null。做成 NOT NULL 的话,每个未跟踪商品的 webhook
+  /// 都会进 dead_letters,而没人知道那是设计。聚合成 DTC snapshot 时跳过 null。
+  available       Int?
+  updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@unique([tenantId, locationId, inventoryItemId])
+  @@map("shopify_location_levels")
+}
+
+// ============================================================================
+// 对账(01 §1)
+// ============================================================================
+
+model ReconciliationRun {
+  id         String    @id
+  tenantId   String    @map("tenant_id")
+  /// 幂等键:同一 run 重复触发不产生第二批行
+  runKey     String    @map("run_key")
+  startedAt  DateTime  @default(now()) @map("started_at") @db.Timestamptz(3)
+  finishedAt DateTime? @map("finished_at") @db.Timestamptz(3)
+
+  tenant Tenant              @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  rows   ReconciliationRow[]
+
+  @@unique([tenantId, runKey])
+  @@map("reconciliation_runs")
+}
+
+/// 04 §4 一行 = SKU / ledger / shopify / amazon / delta / verdict / 差因 / 下一步。
+/// 容忍带:相对差 ≤5%(**分母 = 平台数**,2026-08-20 裁决)且绝对差 ≥1 件才展示。
+model ReconciliationRow {
+  id         String       @id
+  tenantId   String       @map("tenant_id")
+  runId      String       @map("run_id")
+  productId  String       @map("product_id")
+  ledgerQty  Int          @map("ledger_qty")
+  shopifyQty Int?         @map("shopify_qty")
+  amazonQty  Int?         @map("amazon_qty")
+  deltaQty   Int          @map("delta_qty")
+  /// 带内 = 只展示、不影响建议;超带 = 该 Product 建议暂停 + 对账页置顶
+  withinTolerance Boolean @map("within_tolerance")
+  verdict    ReconVerdict
+  /// 差因人话(如 "FBA reserved 有在途退货,报告晚一个周期")
+  reason     String?
+  /// 超带裁决后追加的 correction 事件。指向 append-only 表 —— Restrict(约束 ②)
+  correctionEventId String? @map("correction_event_id")
+  createdAt  DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  tenant          Tenant            @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  run             ReconciliationRun @relation(fields: [runId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  product         Product           @relation(fields: [productId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  correctionEvent InventoryEvent?   @relation(fields: [correctionEventId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@index([tenantId, runId])
+  @@map("reconciliation_rows")
+}
+
+// ============================================================================
+// Allocation 分配(02,08 §2/§4)
+// ============================================================================
+
+/// 每租户一行。18 可调(02 §8);3 FIXED(90d 门槛 / margin excl-ad / health manual)
+/// **不落列** —— 它们不可调,进了表就有人会去改。
+///
+/// 默认值即 v7.4 默认(06 冻结的那一套)。新租户建行不传值即得 v7.4;
+/// `db/verify-schema.sh` 拿种子租户逐字对一遍,免得这里悄悄漂了而 golden 看不见。
+model Params {
+  tenantId String @id @map("tenant_id")
+
+  // Coverage & trigger
+  coverDays   Int @default(35) @map("cover_days")
+  safetyDays  Int @default(14) @map("safety_days")
+  leadDays    Int @default(7) @map("lead_days")
+  ceilingDays Int @default(60) @map("ceiling_days")
+
+  // Demand & velocity
+  velocityWindowDays  Int               @default(90) @map("velocity_window_days")
+  velocityWeighting   VelocityWeighting @default(even) @map("velocity_weighting")
+  excludeStockoutDays Boolean           @default(true) @map("exclude_stockout_days")
+  applyPromo          Boolean           @default(true) @map("apply_promo")
+
+  // Move sizing & margin
+  roundUpToCase Boolean      @default(true) @map("round_up_to_case")
+  minMoveQty    Int          @default(24) @map("min_move_qty")
+  movePriority  MovePriority @default(margin_first) @map("move_priority")
+
+  // Costs & fulfillment(COGS 链与 Amazon 费用是只读输入,不是可调参数)
+  selfShipCostPerOrder Decimal @default("6.90") @map("self_ship_cost_per_order") @db.Decimal(12, 2)
+  mcfEnabled           Boolean @default(true) @map("mcf_enabled")
+  mcfFeePerOrder       Decimal @default("5.87") @map("mcf_fee_per_order") @db.Decimal(12, 2)
+  removalFeePerUnit    Decimal @default("0.97") @map("removal_fee_per_unit") @db.Decimal(12, 2)
+
+  // Alerts & sources
+  alertLeadDays Int  @default(10) @map("alert_lead_days")
+  /// 账号健康全手工(02 §5,FIXED)。IPI 无默认:空值不阻塞,归因写 "account health not set"。
+  ipiScore      Int?  @map("ipi_score")
+  /// null = No limit;有值 = Limited 且这是余量。归因一律带录入日期(缺口 4)。
+  inboundLimitRemaining Int? @map("inbound_limit_remaining")
+  /// 缺口 4:02 §5「引用一律带录入日期」——没有这两列,归因那句话写不出来。
+  ipiEnteredAt   DateTime? @map("ipi_entered_at") @db.Timestamptz(3)
+  limitEnteredAt DateTime? @map("limit_entered_at") @db.Timestamptz(3)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@map("params")
+}
+
+/// 02 §1:全手工,不预置不自学。乘数只乘**前瞻**投影,历史速度永不回调。
+model PromoEvent {
+  id         String     @id
+  tenantId   String     @map("tenant_id")
+  name       String
+  channel    Channel
+  /// 起止按店铺时区的日期(ship-by 与前瞻窗都是日粒度)
+  startsOn   DateTime   @map("starts_on") @db.Date
+  endsOn     DateTime   @map("ends_on") @db.Date
+  multiplier Decimal    @db.Decimal(6, 3)
+  scope      PromoScope
+  createdAt  DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt  DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  tenant   Tenant              @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  products PromoEventProduct[]
+
+  @@map("promo_events")
+}
+
+/// scope = selected_products 时的名单。scope = all_products 时本表无行。
+model PromoEventProduct {
+  id           String @id
+  tenantId     String @map("tenant_id")
+  promoEventId String @map("promo_event_id")
+  productId    String @map("product_id")
+
+  tenant     Tenant     @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  promoEvent PromoEvent @relation(fields: [promoEventId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  product    Product    @relation(fields: [productId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@unique([promoEventId, productId])
+  @@map("promo_event_products")
+}
+
+/// 引擎每日运行落一条(07 §8:供 Watchdog 与排障)。
+model EngineRun {
+  id         String   @id
+  tenantId   String   @map("tenant_id")
+  /// 店铺时区的运行日
+  date       DateTime @db.Date
+  cardCount  Int      @map("card_count")
+  durationMs Int      @map("duration_ms")
+  /// 守门命中(E1 90d 门槛 / E2 断供 / 冷启动 / min qty 拦截 ...)
+  gates      Json
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  tenant Tenant               @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  cards  RecommendationCard[]
+
+  @@unique([tenantId, date])
+  @@map("engine_runs")
+}
+
+/// 08 §4:**卡行不可变,自带快照**。explain 内嵌解析后的全部输入(sellable/velocity/
+/// 继承链解析完的参数值/归因行数组)——"已出卡保留其计算时假设"由此实现,params 表
+/// 不做版本化,历史真相在卡上。
+///
+/// 不可变不是靠自觉:migration 只给 app_runtime **列级** `UPDATE (status)`,表级
+/// UPDATE 一律没有(`has_table_privilege(...,'UPDATE')` = false)。改别的列当场 42501。
+/// 因此本模型**刻意没有 @updatedAt** —— 有了它 Prisma 每次 update 都会连带写一列。
+///
+/// slot 身份 = (tenant, product, card_type, 目的渠道?),同一 slot 任一时刻至多一张
+/// active 卡。目的渠道对 SHARED_POOL 为空,而 PG 的唯一索引里 NULL 彼此不相等
+/// (`NULLS NOT DISTINCT` 在 Prisma 里不支持,已实测报 "No such argument"),
+/// 所以拆成两条部分唯一索引:非空一条、为空一条。合起来才是 08 §4 那条不变量。
+///
+/// ⚠⚠ **这两条索引在 DB 里是部分的,在生成的 client 里却不是**(prisma#29282,7.9.1
+/// 实测复现):generator 照样把 `tenantId_productId_cardType_destChannel` 与
+/// `tenantId_productId_cardType` 塞进了 `WhereUniqueInput`。拿它们做
+/// `findUnique / update / upsert / connect`,**typecheck 全绿、运行时任取一行**
+/// ——两张 superseded 同 slot 卡时实测返回其中一张,而匹配行数是 2。
+/// 这一条下不到 DB,所以由 lint 兜:`eslint.config.js` 禁止源码里出现这两个标识符。
+/// 查 active 卡一律 `findFirst({ where: { …, status: 'active' } })`。
+model RecommendationCard {
+  id          String     @id
+  tenantId    String     @map("tenant_id")
+  runId       String     @map("run_id")
+  productId   String     @map("product_id")
+  cardType    CardType   @map("card_type")
+  /// MOVE_STOCK/MCF_POOL = 目的渠道;STOCKOUT_ETA = 干涸的那个渠道;
+  /// SHARED_POOL 跨渠道合池,无单一渠道 → null
+  destChannel Channel?   @map("dest_channel")
+  /// 04 §3 / G4 出路 2:补货提示**绝不给采购量**(裁决 7);ETA 卡同样无量 → 可空
+  qty         Int?
+  /// 断货日 − lead;遇 Promo 提前到 事件起始 − lead(02 §3.7)
+  shipBy      DateTime?  @map("ship_by") @db.Date
+  explain     Json
+  status      CardStatus @default(active)
+  /// 缺口 5:G5 的 ETA 卡关联 G1 的移动卡(04 §3「关联 MOVE 卡链接」)
+  relatedCardId String?  @map("related_card_id")
+  createdAt   DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  tenant      Tenant               @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  run         EngineRun            @relation(fields: [runId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  product     Product              @relation(fields: [productId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  relatedCard RecommendationCard?  @relation("relatedCard", fields: [relatedCardId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  relatedBy   RecommendationCard[] @relation("relatedCard")
+  feedback    RecommendationFeedback?
+
+  @@unique([tenantId, productId, cardType, destChannel], where: raw("status = 'active' AND dest_channel IS NOT NULL"), map: "rec_cards_active_slot_uq")
+  @@unique([tenantId, productId, cardType], where: raw("status = 'active' AND dest_channel IS NULL"), map: "rec_cards_active_slot_nochannel_uq")
+  @@map("recommendation_cards")
+}
+
+// ============================================================================
+// Delivery 交付(04,08 §2)
+// ============================================================================
+
+/// 04 §6。一期不做自动学习,只采信号。轨道 A 的口头反馈由内部运营录同一张表。
+/// `adjustedQty` **只活在这里**(08 §4:卡行留引擎原值)。
+/// 一张卡至多一条反馈 —— 09 的「对已 adopted 卡再反馈 → 409」下到 DB 就是这条 UNIQUE。
+model RecommendationFeedback {
+  id          String         @id
+  tenantId    String         @map("tenant_id")
+  cardId      String         @unique @map("rec_id")
+  action      FeedbackAction
+  adjustedQty Int?           @map("adjusted_qty")
+  createdAt   DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  tenant Tenant             @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  card   RecommendationCard @relation(fields: [cardId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@map("recommendation_feedback")
+}
+
+model EmailRecipient {
+  id        String   @id
+  tenantId  String   @map("tenant_id")
+  email     String
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@unique([tenantId, email])
+  @@map("email_recipients")
+}
+
+/// 04 §5 最近发送记录。UNIQUE(tenant, date) = 一天一封,重跑不重发。
+model EmailSend {
+  id                String          @id
+  tenantId          String          @map("tenant_id")
+  /// 店铺时区的日期(07:00 按店铺时区发)
+  date              DateTime        @db.Date
+  status            EmailSendStatus
+  recipientCount    Int             @map("recipient_count")
+  /// 失败原因。status='failed' 之外多出来的信息,进日志与 Watchdog。
+  error             String?
+  createdAt         DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@unique([tenantId, date])
+  @@map("email_sends")
+}
+
+// ============================================================================
+// Connectors / Watchdog(03 §3,08 §6)
+// ============================================================================
+
+/// 03 §3:每数据源记录 last_ok_at;E2 判定(任一关键源过期 → 该租户建议暂停)读这张表。
+model SourceStatus {
+  id        String         @id
+  tenantId  String         @map("tenant_id")
+  source    WatchdogSource
+  lastOkAt  DateTime? @map("last_ok_at") @db.Timestamptz(3)
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@unique([tenantId, source])
+  @@map("source_status")
+}
+
+/// 08 §6:翻译失败(缺列、未知枚举、负数量)→ 进这张表 + Watchdog 计数,
+/// **绝不产出半成品事件**;人工检视后重放。
+/// tenantId 可空:未知店铺的 webhook 也要留证(此时归不到租户)。
+model DeadLetter {
+  id         String    @id
+  tenantId   String?   @map("tenant_id")
+  source     Source
+  payload    Json
+  reason     String
+  replayedAt DateTime? @map("replayed_at") @db.Timestamptz(3)
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  tenant Tenant? @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@index([tenantId, source])
+  @@map("dead_letters")
+}

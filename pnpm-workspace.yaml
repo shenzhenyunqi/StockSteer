@@ -3,6 +3,11 @@ packages:
   - apps/*
   - tools/*
 
-# pnpm 10 默认拦截依赖的 postinstall;vite 的 esbuild 需要放行
+# pnpm 10 默认拦截依赖的 postinstall;vite 的 esbuild 需要放行。
+# prisma / @prisma/engines 的 postinstall 是**下载 schema engine 二进制**。不放行
+# 也能跑(CLI 首次调用时会自己去下),但那会把一次网络下载塞进 `prisma generate`
+# 或 `migrate` 的中途 —— 装的时候下完、失败在 install 段,比失败在 CI 第三步好读。
 onlyBuiltDependencies:
   - esbuild
+  - prisma
+  - '@prisma/engines'
