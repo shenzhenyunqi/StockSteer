@@ -170,16 +170,16 @@ jobs:
           echo "$schemas"
           pnpm exec prisma generate
 
-      # 走 `pnpm typecheck`(= `pnpm -r typecheck`)而不是 `tsc -b tsconfig.json`:
-      # 根 tsconfig.json 的 references 是**手写**的三条,而 `pnpm -r` 的覆盖面由
-      # pnpm-workspace.yaml 自动决定。P1-T6 要建的 tools/track-a 不会自己进 references,
+      # 走 `pnpm typecheck`(= `pnpm -r typecheck`),与 CLAUDE.md「## 命令」一节、
+      # 与本地敲的完全同源 —— CI 不该有一条本地没有的路径。
+      # 曾经写的是 `tsc -b tsconfig.json`(根上那个 project references 解决方案文件),
+      # 已连同那个文件一起废弃:它的 references 是**手写**的三条,而 `pnpm -r` 的覆盖面
+      # 由 pnpm-workspace.yaml 自动决定。P1-T6 要建的 tools/track-a 不会自己进 references,
       # 走根 tsconfig 就会被 CI 静默跳过 —— 漂的方向是「CI 绿、本地红」,最坏的那种。
-      # 而且这条命令与 CLAUDE.md「## 命令」一节、与本地敲的完全同源。
       # 增量收益一分没丢:`pnpm -r typecheck` 在 core/contracts/server 里跑的同样是
       # `tsc -b`、命中同样的 .tsbuildinfo(可用 `tsc -b --dry` 自证下一段 build 仍是
       # up-to-date);apps/web 的 typecheck 是 `tsc --noEmit`,它走 Bundler 解析、由 vite
-      # 编,本来就不在 references 里,这条命令顺带把它捎上了。
-      # 根 tsconfig.json 保留不动:它仍是编辑器与手工 `tsc -b` 的入口。
+      # 编,本来就不在任何 references 里,这条命令顺带把它捎上了。
       - name: 2/5 typecheck
         run: pnpm typecheck
 
