@@ -1,5 +1,5 @@
 # P0-T4 · CI —— 五段 lint → typecheck → build → unit → integration
-# (07 §7 **要求** merge 条件 = 全绿;⚠ 这道闸门此刻尚未配置,见下面第二段)
+# (07 §7:merge 条件 = 全绿。闸门已配,见下面第二段)
 #
 # 为什么是「一个 job 的五个 step」而不是「五个 job」:
 #   ① 五段本来就严格串行(spec 里那串箭头),拆成 job 只能用 needs 再串回去,并行度是 0,
@@ -9,13 +9,13 @@
 #      三个 tsc 全是 up-to-date)。拆 job 就得把 dist 当 artifact 传,或者让 build 把整棵
 #      引用图重编一遍 —— 两段互相踩,正是要避免的。
 #
-# ⚠ 「全绿才 merge」这句话**目前还不成立**,别照字面读:
-#   本 job(`ci`)是**设计为**分支保护的 required status check 的,但 2026-08-20 实测,
-#   远端一条都没配 —— `gh api repos/shenzhenyunqi/StockSteer/rulesets` → `[]`、
-#   `.../branches` → `[]`(远端零分支)、`.../branches/master/protection` → 404。
-#   在有人去 GitHub 上把 `ci` 勾成 required check 之前,这份 workflow 只「会跑」、不「会拦」:
-#   红着照样能 merge、也能直推。要不要走 PR 流程是人的裁决,故本轮不代配 —— 但也别
-#   把这份文件的存在当成闸门已经落下。
+# 闸门(2026-08-20 已配,ruleset「master 稳定分支保护」):
+#   本 job 的 check 名就是 job id `ci`,已设为 master 的 required status check;
+#   master 另有「必须经 PR」「禁 force-push」「禁删分支」。日常在 dev 上做,PR 回 master。
+#   验过不是空转:拿一个空提交直推 master,被 `GH013` 拒掉,两条理由都报了
+#   (`Changes must be made through a pull request.` / `Required status check "ci" is expected.`)。
+#   注意闸门活在 GitHub 的 repo rules 里、不在本仓库 —— 改这份文件改不动它,
+#   反过来,谁把 job id 从 `ci` 改掉,required check 就会永远等一个不存在的 check。
 #
 # ⚠ 同理,P0-T5 那句「push → CI → deploy」的箭头此刻名不副实:Railway 是自己监听 master
 #   的 push,与本 workflow 并行、互不依赖 —— CI 红了照样部署。Railway 有 service 级的

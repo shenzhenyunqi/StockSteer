@@ -30,7 +30,7 @@ pnpm db:down
 ## 边界(0 由 DB 权限兜底,1–4 由 eslint 硬拦)
 
 > CI 已搭(`.github/workflows/ci.yml`:lint → typecheck → build → unit → integration 五段,push master + PR 触发)。日常在 `dev` 上做,PR 回 `master`。
-> **但「全绿才 merge」这道闸门还没配**:2026-08-20 实测远端既无 ruleset 也无 branch protection、required status check 一条都没有(`gh api …/rulesets` → `[]`、`…/branches` → `[]`、`…/branches/master/protection` → 404)。在有人去 GitHub 上把 `ci` 勾成 required check 之前,CI 只「会跑」不「会拦」——红着照样能 merge、也能直推。**别把「CI 会拦住」当既成事实**。
+> **闸门已配**(2026-08-20,ruleset `master 稳定分支保护`):master 只能经 PR 进、`ci` 必须绿、禁 force-push、禁删分支。实测直推 master 被拒:`GH013 … Changes must be made through a pull request. / Required status check "ci" is expected.`——不是"文件里写了",是推过一次真被拦。要改动这道闸门去 GitHub 的 repo rules,别指望改仓库里的文件。
 > 各段的成色也不一样:**lint / typecheck / build 三段是活的门**(树里代码还极少,所以此刻拦得住的东西不多,但压力随代码增长自动加上来);`db:verify` 的 28 条权限断言是活的;**unit / integration 两段是空转的绿**——`--passWithNoTests` 让它们收集到 0 个测试也不红(CI 里为此挂 warning),golden tests 到 P1 才补。
 >
 > 两笔欠账(P0 的 DoD 缺口,别只活在 PR 描述里):
