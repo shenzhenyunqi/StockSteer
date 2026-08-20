@@ -54,6 +54,7 @@ pnpm db:down
 > ⑤ **`reconciliation_rows` 缺 channel/state**(P3-T6 前)。correction 事件必须带 `(channel, state, qty)`,而行里没有 channel,超带裁决时造不出来;更实的风险是一个双挂牌 Product 的 DTC +50 / FBA −50 会合并成 delta 0 判成 Match,两个渠道都错。**故意留到 P3-T6**:行的粒度取决于拍板 1(对账超带裁决形态,≈9/1 才定),现在猜一个粒度比缺一个更难改。可变表。
 > ⑥ **remap 事件无落点**(P6-T5 前)。01 §2「合并 Product 时追加 remap 事件,禁止 UPDATE」,而 `InvKind` 只有 snapshot|delta|correction,也没有 catalog 事件表。T3 spec 的表清单同样漏了。补法是加枚举值或新建一张表,都不属于「事件表补列」那类不可逆操作。
 > ⑦ **`sku_mappings` 要不要「一个 listing 至多一条 confirmed」**(P6-T5 定)。复核建议加部分唯一索引,**暂不加**:没有任何 spec 声明过这条不变量,而商家给同一个 Shopify variant 挂两个 ASIN 是真实存在的形态——加错了会挡住合法数据,比缺一条约束更糟。P6-T5 拿真数据定。
+> ⑧ **`shopify.app.stocksteer.toml` 的 `automatically_update_urls_on_dev` 要在 P0-T5 改成 `false`**。联调期靠它把 tunnel URL 写回 Partner Dashboard;Railway 上线后不改,本地一跑 `shopify app dev` 就会把线上 `application_url` / `redirect_urls` 冲掉,线上安装当场断。文件里留了注释,但注释不会在 P0-T5 那天自己响。
 
 0. **DB 三身份,权限 fail-closed**。`migrator`(DDL)/ `app_runtime`(运行时)/ `app_purger`(只为 30 天物理删除而生:三张事件表的 SELECT+DELETE,别的一律没有)。
    **fail-closed**:`ALTER DEFAULT PRIVILEGES` 只给 `SELECT, INSERT`,新表天然 append-only;**可变表**要在自己的 migration 里显式 `GRANT UPDATE, DELETE`。漏写的表当场写不动——这是设计,不是 bug。运行时身份 `app_runtime` 永不持有事件表的 UPDATE/DELETE。
