@@ -62,6 +62,14 @@ export default tseslint.config(
     files: ['apps/server/src/infra/**/*.ts'],
     rules: { '@typescript-eslint/no-restricted-imports': 'off' },
   },
+  // 规则 2 的第二个、也是**唯一另一个**例外:Prisma 7 的 CLI 配置文件。
+  // 它必须叫这个名字、必须在仓库根(CLI 只在那儿找它),所以"只活在 infra/"
+  // 这条规则对它天然不成立。例外面收到精确文件名,不是目录 ——
+  // 根上再多一个 .ts 文件想 import prisma,照样被拦(CI 的 lint 双向断言里有这条红)。
+  {
+    files: ['prisma.config.ts'],
+    rules: { '@typescript-eslint/no-restricted-imports': 'off' },
+  },
 
   // 规则 1:core import 白名单
   {
@@ -86,6 +94,32 @@ export default tseslint.config(
   {
     files: ['packages/core/src/acl/**/*.test.ts'],
     rules: { 'no-restricted-syntax': ['error', coreImportWhitelistTest] },
+  },
+
+  // 规则 5(P0-T3):禁用 recommendation_cards 那两个「假唯一键」。
+  //
+  // active-slot 是**部分**唯一索引(WHERE status='active'),但 Prisma 7.9.1 照样把复合键
+  // 塞进了生成的 `WhereUniqueInput`(prisma#29282,已在 7.9.1 实测复现)。用它做
+  // findUnique/update/upsert/connect 会**typecheck 全绿、运行时任取一行** ——
+  // 实测:两张 superseded 的同 slot 卡(部分索引按设计不拦它们),findUnique 返回其中一张,
+  // 而实际匹配 2 行。08 §4「一个 slot 至多一张 active」在客户端这一侧完全没有兑现。
+  //
+  // 这一条下不到 DB(DB 侧是对的),所以由 lint 兜。查 active 卡一律写
+  // `findFirst({ where: { tenantId, productId, cardType, status: 'active' } })`。
+  // 只挂 apps/server:Prisma 只活在那儿,而且这里挂 no-restricted-syntax 不会和
+  // packages/core 那几块互相覆盖(该规则的选项不跨块合并)。
+  {
+    files: ['apps/server/**/*.ts'],
+    rules: {
+      'no-restricted-syntax': [
+        'error',
+        {
+          selector: 'Identifier[name=/^tenantId_productId_cardType(_destChannel)?$/]',
+          message:
+            'active-slot 是部分唯一索引,这个复合键在 client 里是假的唯一键(prisma#29282):findUnique 会静默退化成 findFirst。改用 findFirst({ where: { …, status: \'active\' } })',
+        },
+      ],
+    },
   },
 
   // 规则 3:web 禁接口类型断言(09 §3)

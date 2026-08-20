@@ -4,44 +4,17 @@
 #   本地:  pnpm db:verify
 #   CI  :  P0-T4 的 integration 段调同一份(07 §8「靠权限兜底,不靠纪律」的可执行兑现)
 #
-# 注:大部分断言只能用探针表,因为真实事件表要到 P0-T3 才存在。末尾那段「事件表」
-# 断言是自激活的:三张表还不存在就 SKIP,T3 建表当天自己醒过来,不需要谁记得回来接线。
+# 探针表这套写法是 T2 时的产物(那会儿真实表还不存在),**留着不是历史包袱**:
+# 它证明的是「新建的任意一张表天然只有 SELECT+INSERT」这条默认权限本身,与树里
+# 此刻恰好有哪些表无关。针对真实表的断言在 db/verify-schema.sh(T3 起)。
+# 末尾那段「三张事件表」是自激活的,2026-08-20 T3 建表当天已自己醒过来(不再 SKIP)。
 set -uo pipefail
 
-# 主机名必须是 compose 服务名 `postgres`,**不能是 localhost**:官方镜像的 pg_hba.conf
-# 有 `host all all 127.0.0.1/32 trust`,走 loopback 时口令完全不校验——口令全错
-# 也能跑出 11/11 全绿,而应用/Prisma/CI 侧走的是 scram 那条路。服务名解析到
-# bridge IP(非 loopback)=> 命中 `host all all all scram-sha-256`,凭据才真的被验。
-MIG="${MIGRATOR_DATABASE_URL:-postgresql://migrator:${MIGRATOR_PASSWORD:-migrator}@postgres:5432/stocksteer}"
-RUN="${DATABASE_URL:-postgresql://app_runtime:${APP_RUNTIME_PASSWORD:-app_runtime}@postgres:5432/stocksteer}"
-PRG="${PURGER_DATABASE_URL:-postgresql://app_purger:${PURGER_PASSWORD:-app_purger}@postgres:5432/stocksteer}"
+# 连接串、断言原语、preflight 全在共用底座里(两份 verify 脚本不能各抄一份 pg_hba
+# 的那条约束 —— 抄两份就会漂,而漂掉的那份跑出来是满绿)。
+. "$(dirname "$0")/_assert-lib.sh"
 
-fail=0
-ok()  { printf '  PASS  %s\n' "$1"; }
-bad() { printf '  FAIL  %s\n        %s\n' "$1" "${2:-}"; fail=1; }
-run() { psql "$1" -v ON_ERROR_STOP=1 -v VERBOSITY=verbose -tAqc "$2" 2>&1; }
-
-expect_ok() { local out rc; out=$(run "$1" "$2"); rc=$?
-  [ $rc -eq 0 ] && ok "$3" || bad "$3" "$out"; }
-expect_denied() { local out rc; out=$(run "$1" "$2"); rc=$?
-  if [ $rc -eq 0 ]; then bad "$3" "竟然成功了 -> $out"
-  elif grep -q "42501" <<<"$out"; then ok "$3"   # 断 SQLSTATE,不断文本
-  else bad "$3" "$out"; fi; }
-expect_eq() { local out; out=$(run "$1" "$2")
-  [ "$out" = "$3" ] && ok "$4" || bad "$4" "得到 [$out],期望 [$3]"; }
-
-echo "· preflight(这套断言本身可不可信)"
-# 上面那段注释挡不住 env 覆盖:MIGRATOR_DATABASE_URL / DATABASE_URL 会无条件胜出,
-# 而 .env.example 里那两条串正是 @127.0.0.1 —— 谁 `set -a; . .env` 一下,
-# 整份"证明"就静默退回 trust 通道。所以在库里自证,而不是在注释里叮嘱。
-for pair in "MIG:$MIG:migrator" "RUN:$RUN:app_runtime" "PRG:$PRG:app_purger"; do
-  tag=${pair%%:*}; rest=${pair#*:}; url=${rest%:*}; want=${rest##*:}
-  expect_eq "$url" "select (inet_client_addr() is null
-                         or inet_client_addr() <<= inet '127.0.0.0/8'
-                         or inet_client_addr() <<= inet '::1/128')::text" \
-    "false" "$tag 不走 loopback/socket(否则 pg_hba 的 trust 让口令形同虚设)"
-  expect_eq "$url" "select current_user" "$want" "$tag 的身份确实是 $want"
-done
+preflight
 
 run "$MIG" "DROP TABLE IF EXISTS _probe_child, _probe_parent, _probe_event, _probe_mutable CASCADE" >/dev/null
 
@@ -137,17 +110,20 @@ out=$(run "$MIG" "$CASCADE_GUARD")
                  || bad "上条断言非空转" "造了级联外键却仍是 [$out]"
 run "$MIG" "DROP TABLE IF EXISTS _probe_child, _probe_parent CASCADE" >/dev/null
 
-echo "· 三张真实事件表(P0-T4 spec 点名要的那条;T3 建表当天自动生效)"
+echo "· 三张真实事件表(P0-T4 spec 点名要的那条;T3 建表后已生效)"
 # 上面那条全局断言刻意**不含 UPDATE/DELETE** —— 约十九张可变表合法持有它们,一并查会
 # 天天误报。代价是「三张事件表没有 UPDATE/DELETE」到此为止仍然没有任何东西在断言,
 # 而那正是 00-README 一票否决项 4 与 01 §1 共同压着的那条线。
 # TRUNCATE/REFERENCES/TRIGGER 也列上:给可变表批量放权时写成 `GRANT ALL` 会把它们
 # 一并带进来,而写错一次表名,两道防线都不响。
 # has_table_privilege 的多权限写法是**任一命中即 true**,所以期望值是 false。
-# 用 to_regclass 判存在:返回 NULL 就 SKIP(今天的情形),不必等谁记得回来加这几行。
+# T3 之前这里是「表不存在就 SKIP」的自激活写法。**T3 落地后已改成硬红**:
+# 表在了就该一直在,继续留一条静默通过的路径等于给自己留一个假绿的口子
+# (SKIP 是这份脚本里唯一的静默通过路径,而 db/verify-schema.sh 的前置断言
+#  已经在缺表时直接红了 —— 两处口径要一致)。
 for t in inventory_events sales_events stockout_observations; do
   if [ "$(run "$MIG" "select (to_regclass('public.$t') is not null)::text")" != "true" ]; then
-    printf '  SKIP  %s\n        表尚不存在(P0-T3 未落地),建表当天这条断言自动启用\n' "$t"
+    bad "$t:表存在" "表不见了。T3 之后它必须在 —— 先跑 pnpm db:migrate"
     continue
   fi
   expect_eq "$MIG" \
@@ -157,6 +133,5 @@ for t in inventory_events sales_events stockout_observations; do
 done
 
 run "$MIG" "DROP TABLE IF EXISTS _probe_event, _probe_mutable CASCADE" >/dev/null
-echo
-[ $fail -eq 0 ] && echo "权限矩阵全过" || echo "有断言失败"
-exit $fail
+summary "权限矩阵"
+exit $?
