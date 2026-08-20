@@ -17,20 +17,40 @@ pnpm lint
 pnpm test            # vitest,unit / integration 两 project
 pnpm test:unit       # golden tests
 pnpm test:integration
+
+pnpm db:up            # compose 起 PG + Redis(--wait 到 healthy)
+pnpm db:verify        # 双角色权限矩阵;改了权限务必重跑
+pnpm db:roles         # 只重跑角色脚本 —— 任何 prisma reset 之后必须跑(它会 DROP SCHEMA,把默认权限一起带走)
+pnpm db:reset         # down -v 重建卷(连 redis 数据一起炸)—— 改了 db/roles.sql 或口令才走这条
+pnpm db:down
 ```
 
-## 四条边界(eslint 硬拦,CI merge 条件)
+> `db/init/` 只在数据卷**首次初始化**时执行。改了角色脚本而没 `db:reset`,你的库不会变。
 
+## 边界(0 由 DB 权限兜底,1–4 由 eslint 硬拦)
+
+> CI 尚未搭(P0-T4 才做),现在这些门只在本地 `pnpm lint` / `pnpm db:verify` 生效。**别把「CI 会拦住」当既成事实**。
+
+0. **DB 三身份,权限 fail-closed**。`migrator`(DDL)/ `app_runtime`(运行时)/ `app_purger`(只为 30 天物理删除而生:三张事件表的 SELECT+DELETE,别的一律没有)。
+   **fail-closed**:`ALTER DEFAULT PRIVILEGES` 只给 `SELECT, INSERT`,新表天然 append-only;**可变表**要在自己的 migration 里显式 `GRANT UPDATE, DELETE`。漏写的表当场写不动——这是设计,不是 bug。运行时身份 `app_runtime` 永不持有事件表的 UPDATE/DELETE。
 1. **`packages/core` 依赖白名单 = `zod` / `ulid` / `decimal.js`**,零 IO、零框架、不含子路径。时区用 Node 内置 `Intl`(不引库);CSV 切分不进 core(只做逐行纯翻译)。
 2. **Prisma 只许出现在 `apps/server/src/infra/`** —— 包名与路径两条都拦。Prisma 7 起生成的 client 在源码树(`infra/prisma/generated/`),import 是相对路径而非 `@prisma/*`。
 3. **`apps/web` 禁类型断言** —— 接口类型一律从 `packages/contracts` 推断。
 4. **core 除 `acl/` 外禁平台词汇**(fulfillable / available / committed / AFN / MFN)——平台语言不越过反腐层。
 
-另有两条纪律靠 review 兜底:事件表 append-only(DB 权限兜底,不靠自觉)· 大文件一律流式,整文件读进内存 = 打回。
+**指向事件表的外键一律 `Restrict`/`NoAction`** —— 外键级联以被引用表的权限执行,能绕过上面第 0 条把事件行抹掉或改写;权限挡不住,只能在 FK 上堵。
+
+大文件一律流式,整文件读进内存 = review 打回。
 
 ## 钉版
 
-Node 22.x · TypeScript **5.9**(不上 7.0:typescript-eslint 8 的 peer 是 `<6.1.0`,lint 是硬门)· pnpm 10 · Prisma 7(`provider = "prisma-client"`、`output` 必填、须装 `@prisma/adapter-pg`、`generate`/`db seed` 不再隐式跑)。
+PostgreSQL **16** · Redis **7**(PG 大版本本地与 Railway 必须一致,一期不设 staging)· Node 22.x · TypeScript **5.9**(不上 7.0:typescript-eslint 8 的 peer 是 `<6.1.0`,lint 是硬门)· pnpm 10 · Prisma 7(`provider = "prisma-client"`、`output` 必填、须装 `@prisma/adapter-pg`、`generate`/`db seed` 不再隐式跑)。
+
+## 工作方式:写-审-改分 agent
+
+写完 spec 或代码后,**审那一步交给独立 agent**——不参与写作、不继承写作时的推理,只拿产物 + 上游约束找矛盾。触发点:spec/plan 写完、每个 P 阶段收口前、commit 前。
+
+审要跑两条轴:**对外事实**(平台文档、库的真实行为)与**对内闭包**(下游任务需要的依赖/字段/能力 → 加总 → 对上游声明的约束)。2026-08-20 的教训:自审只跑了对外那条,p0 §0 里"只准三个库"与"要用一个 tz 库"隔两行的矛盾一直没被发现,动工第一天才撞上。
 
 ## 不变量(一票否决)
 

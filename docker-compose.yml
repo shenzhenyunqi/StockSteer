@@ -1,0 +1,50 @@
+name: stocksteer
+
+services:
+  postgres:
+    # 大版本必须与 Railway 一致(P0-T5 钉同一大版本);一期不设 staging,
+    # 本地就是唯一预演场,大版本漂移的代价直接落在 production(07 §7)
+    image: postgres:16
+    environment:
+      POSTGRES_DB: stocksteer
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      MIGRATOR_PASSWORD: ${MIGRATOR_PASSWORD:-migrator}
+      APP_RUNTIME_PASSWORD: ${APP_RUNTIME_PASSWORD:-app_runtime}
+      PURGER_PASSWORD: ${PURGER_PASSWORD:-app_purger}
+    ports:
+      # 只绑本机:仓库 public,默认口令是开发用的,不能对外听(07 §1)
+      - '127.0.0.1:5432:5432'
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db:/db:ro
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # 必须带 -h:initdb 阶段官方 entrypoint 起的临时 server 只听 unix socket
+      # (listen_addresses=''),不带 -h 的 pg_isready 走 socket 会在 init 脚本
+      # 跑完之前就报 healthy —— CI 空卷冷跑会拿到"角色还不存在"的库(P0-T4)
+      test: ['CMD-SHELL', 'pg_isready -h 127.0.0.1 -U postgres -d stocksteer']
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      # 冷 CI runner 上 initdb 会明显变慢;没有 start_period 会先被判 unhealthy
+      start_period: 30s
+
+  redis:
+    image: redis:7
+    # 挂了卷就让持久化意图落地;noeviction 是 BullMQ 的要求
+    command: ['redis-server', '--appendonly', 'yes', '--maxmemory-policy', 'noeviction']
+    ports:
+      - '127.0.0.1:6379:6379'
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+volumes:
+  pgdata:
+  redisdata:

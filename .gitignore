@@ -6,4 +6,9 @@ node_modules/
 dist/
 .env
 .env.*
+# 模板必须进版本库(否则 T2 交付一半空气);gitignore 不支持行尾注释,注释必须单起一行
+!.env.example
 *.tsbuildinfo
+
+# Prisma 7 把 client 生成进源码树(T3),但它是机器产物、CI 会显式 generate
+apps/server/src/infra/prisma/generated/

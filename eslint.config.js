@@ -12,6 +12,12 @@ const coreImportWhitelist = {
   message: 'core 的运行时依赖只允许 zod / ulid / decimal.js(p0 §0):零 IO、零框架',
 }
 
+/** 测试文件例外:golden tests 按 07 §1 全在 packages/core,vitest 是开发依赖不是运行时依赖 */
+const coreImportWhitelistTest = {
+  selector: `ImportDeclaration[source.value!=/^(\\.|zod$|ulid$|decimal\\.js$|vitest$)/]`,
+  message: 'core 测试的依赖只允许 zod / ulid / decimal.js / vitest(p0 §0)',
+}
+
 const platformVocabBan = [
   {
     selector: `Identifier[name=/${PLATFORM_VOCAB}/i]`,
@@ -68,6 +74,18 @@ export default tseslint.config(
     files: ['packages/core/**/*.ts'],
     ignores: ['packages/core/src/acl/**'],
     rules: { 'no-restricted-syntax': ['error', coreImportWhitelist, ...platformVocabBan] },
+  },
+  // core 的测试文件:放行 vitest。不开这个口子,P1 写下第一条 golden 断言时
+  // lint 就红——而 lint 是 CI 四段之首、merge 硬门。
+  {
+    files: ['packages/core/**/*.test.ts'],
+    ignores: ['packages/core/src/acl/**'],
+    rules: { 'no-restricted-syntax': ['error', coreImportWhitelistTest, ...platformVocabBan] },
+  },
+  // acl/ 的测试要拿平台词汇当测试数据(它测的就是平台→领域的翻译)
+  {
+    files: ['packages/core/src/acl/**/*.test.ts'],
+    rules: { 'no-restricted-syntax': ['error', coreImportWhitelistTest] },
   },
 
   // 规则 3:web 禁接口类型断言(09 §3)
