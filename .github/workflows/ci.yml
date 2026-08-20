@@ -1,0 +1,273 @@
+# P0-T4 · CI —— 五段 lint → typecheck → build → unit → integration
+# (07 §7:merge 条件 = 全绿。闸门已配,见下面第二段)
+#
+# 为什么是「一个 job 的五个 step」而不是「五个 job」:
+#   ① 五段本来就严格串行(spec 里那串箭头),拆成 job 只能用 needs 再串回去,并行度是 0,
+#      却要多付四次 checkout + pnpm install 的钱;
+#   ② typecheck 与 build 共用同一份 dist/.tsbuildinfo —— 同 job 里 typecheck 的 `tsc -b`
+#      产出的增量信息直接被 build 命中(本机实测:build 段只剩 apps/web 的 vite 在真跑,
+#      三个 tsc 全是 up-to-date)。拆 job 就得把 dist 当 artifact 传,或者让 build 把整棵
+#      引用图重编一遍 —— 两段互相踩,正是要避免的。
+#
+# 闸门(2026-08-20 已配,ruleset「master 稳定分支保护」):
+#   本 job 的 check 名就是 job id `ci`,已设为 master 的 required status check;
+#   master 另有「必须经 PR」「禁 force-push」「禁删分支」。日常在 dev 上做,PR 回 master。
+#   验过不是空转:拿一个空提交直推 master,被 `GH013` 拒掉,两条理由都报了
+#   (`Changes must be made through a pull request.` / `Required status check "ci" is expected.`)。
+#   注意闸门活在 GitHub 的 repo rules 里、不在本仓库 —— 改这份文件改不动它,
+#   反过来,谁把 job id 从 `ci` 改掉,required check 就会永远等一个不存在的 check。
+#
+# ⚠ 同理,P0-T5 那句「push → CI → deploy」的箭头此刻名不副实:Railway 是自己监听 master
+#   的 push,与本 workflow 并行、互不依赖 —— CI 红了照样部署。Railway 有 service 级的
+#   "Wait for CI" 开关能把这个箭头做实。列为 T5 待办,本轮不动 Railway 任何配置。
+#
+# 三个 action 的版本核实于 2026-08-20(逐个查了官方 releases,不是凭记忆写的):
+#   actions/checkout    v7.0.1
+#   actions/setup-node  v7.0.0
+#   pnpm/action-setup   v6.0.10 —— pnpm 官方的后继 action 是 pnpm/setup,但那条路是给
+#                       pnpm v11+ 的;我们钉 pnpm@10.26.2,仍归 action-setup 管。
+
+name: CI
+
+on:
+  push:
+    # 2026-08-20 裁决:主干叫 master(远端 default_branch 同步改成 master),日常在 dev
+    # 上做、PR 回 master。所以 push 只认 master —— dev 上的每次推送靠 pull_request
+    # 触发,不必两头都跑。
+    branches: [master]
+  pull_request:
+
+# 仓库 public,本 job 只读代码、不写回任何东西。默认 permissions 实测当前已是 read,
+# 但那是仓库级设置、是别人随手能改的旋钮;在这里钉死才作数。
+permissions:
+  contents: read
+
+# 同分支连推两次会并行跑两份 —— 烧 runner 是小事,两份 compose 同时抢 5432/6379 才是
+# 真会红的那种。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    # 钉 24.04 而不是 ubuntu-latest:项目里 PG16 / Node 22 / pnpm 10.26.2 全钉了,唯独
+    # runner 浮动没道理。Ubuntu 26.04 已进 public preview,`ubuntu-latest` 的迁移是
+    # 1–2 个月的渐进过程 —— 钉版是为了不在迁移当天变成考古现场。
+    # 依赖的不变量(不写死镜像 build 号,那种数字每周都变、写了也只是过期得慢一点):
+    # GitHub 托管镜像自带的 postgresql 服务**默认不启动**、镜像里**压根没装 redis**,
+    # 所以 compose 去绑 127.0.0.1 的 5432/6379 不会撞端口(该不变量在 26.04 镜像上同样成立)。
+    # docker 与 compose v2 预装,不需要任何 setup-docker 之类的步骤。
+    runs-on: ubuntu-24.04
+
+    # `pnpm db:up` 的 `--wait` 本身没有超时:冷跑拉镜像卡住的话,会一路等到 GitHub 的
+    # 6 小时上限才被砍。
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # pnpm 必须排在 setup-node 前面:setup-node 的 `cache: pnpm` 要先跑 `pnpm store path`
+      # 才知道缓存目录在哪,顺序反了它当场找不到 pnpm(官方 docs/advanced-usage.md 的示例
+      # 就是这个顺序)。
+      # 刻意不写 version:版本的唯一真值源是 package.json 的 packageManager(pnpm@10.26.2)。
+      # 两处都写、哪天漂了一个字,就是 ERR_PNPM_BAD_PM_VERSION。
+      - uses: pnpm/action-setup@v6
+
+      # 写死 '22',不用 node-version-file: package.json —— 后者读的是 engines.node(">=22"),
+      # 会解析成「满足区间的最新版」,直接越过 §0 的 Node 22.x 钉版(Prisma 7 推荐 22.x)。
+      # cache 这一行必须显式给:setup-node v6 起把「自动缓存」收窄到只认 packageManager
+      # 写着 npm 的项目,我们写的是 pnpm —— 不显式给就是一点缓存都没有,而且不会报错。
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      - name: pnpm install
+        run: pnpm install --frozen-lockfile
+
+      - name: 1/5 lint
+        run: pnpm lint
+
+      # 按 CLAUDE.md 自己的说法,lint 是此刻仅有的几道活门之一 —— 而仅有的活门没有回归
+      # 保护。eslint.config.js 里钉着的那条教训(core 的 import 白名单曾经把 `vitest` 一起
+      # 拦掉)根因就是:T1 只验了「违规会红」、没验「合规不红」。spec 的 T1 一节要求过
+      # 「合法样例必须 0 error」,但那次验收只发生在当时那位作者的终端里,没有任何持久化载体。
+      #
+      # 用 `--stdin` + `--stdin-filename` 喂虚拟路径:完全不落文件、不污染 `pnpm lint` 的
+      # 收集面、亚秒级。红的断 exit != 0,绿的断 exit == 0,任一不符整段红并打印实际输出。
+      - name: lint 双向断言(违规拦得住 + 合规不误伤)
+        run: |
+          set -o pipefail
+          fail=0
+          # assert_lint <red|green> <虚拟路径> <说明> <代码>
+          assert_lint() {
+            local want=$1 path=$2 desc=$3 code=$4 out rc
+            out=$(printf '%s\n' "$code" | pnpm exec eslint --stdin --stdin-filename "$path" 2>&1) && rc=0 || rc=$?
+            # 红断 rc == 1 而不是 rc != 0:eslint 的 1 才是「查出 lint 错误」,2 是配置级
+            # 致命错误、127 是连命令都没找到。用 != 0 的话,配置炸了/eslint 没装上也会被
+            # 当成「规则拦住了」—— 三条 red 全部假绿(实测踩过一次:rc=127 照样 PASS)。
+            if { [ "$want" = red ] && [ "$rc" -eq 1 ]; } || { [ "$want" = green ] && [ "$rc" -eq 0 ]; }; then
+              printf '  PASS  [%s] %s\n' "$want" "$desc"
+            else
+              printf '  FAIL  [期望 %s,实际 exit=%s] %s\n%s\n' "$want" "$rc" "$desc" "$out"
+              fail=1
+            fi
+          }
+
+          # 规则 1:core 依赖白名单只有 zod / ulid / decimal.js
+          assert_lint red packages/core/src/x.ts \
+            '规则1 core:白名单外的 import 被拦' \
+            "import 'node:fs'"
+          # H4 回归点:白名单曾经把 vitest 一起拦掉,P1 第一条 golden 会当场撞上
+          assert_lint green packages/core/src/fold.test.ts \
+            '规则1 例外:core 测试可以 import vitest' \
+            "import { it } from 'vitest'
+          it('x', () => {})"
+          # 规则 4 的例外:acl/ 的测试要拿平台词汇当测试数据(它测的就是平台→领域的翻译)
+          assert_lint green packages/core/src/acl/x.test.ts \
+            '规则4 例外:acl 测试可以出现平台词汇' \
+            "import { it } from 'vitest'
+          const fulfillable = 1
+          it('x', () => { void fulfillable })"
+          # 规则 2:Prisma 7 的 client 在源码树里,import 是相对路径 —— 包名与路径两条都要拦
+          assert_lint red apps/server/src/routes/x.ts \
+            '规则2 server:infra 外 import 生成的 client 被拦' \
+            "import { PrismaClient } from '../infra/prisma/generated/client.js'
+          void PrismaClient"
+          assert_lint green apps/server/src/infra/db.ts \
+            '规则2 例外:infra 内可以 import 生成的 client' \
+            "import { PrismaClient } from '../infra/prisma/generated/client.js'
+          void PrismaClient"
+          # 规则 3:web 禁类型断言(接口类型一律从 contracts 推断)
+          assert_lint red apps/web/src/x.ts \
+            '规则3 web:类型断言被拦' \
+            "const x: unknown = 1
+          export const y = x as number"
+
+          [ "$fail" -eq 0 ] || { echo "::error file=eslint.config.js::lint 双向断言有失败(上面 FAIL 行)"; exit 1; }
+
+      # Prisma 7 取消了隐式生成(§0 五件套③:migrate dev / db push / postinstall 都不再带
+      # generate),schema 一进仓库就必须显式生成,否则 typecheck 拿不到 client。
+      #
+      # 探测而非写死路径:写死路径的失败形态是「路径一漂就永远静默跳过」,而静默跳过的
+      # 后果是运行时炸、不是 CI 红。`git ls-files '*.prisma'` 的 pathspec 里 `*` 跨 `/`
+      # (已验证 `git ls-files '*.sql'` → `db/roles.sql`),schema 挪到哪都跑不掉。
+      #
+      # 为什么是条件式而不是「见到 schema 就 exit 1 逼人来改」:GitHub Actions 里 step
+      # 一失败,后面所有 step 全部 skip。那样写的话,T3 落地当天的第一次 CI 会是
+      # lint 绿 → 守卫红 → typecheck/build/unit/integration 全 skip → `db:verify` 一次
+      # 都没跑 —— 而 spec 把 T4 提到 T3 之前的**唯一理由**,就是让 T3 手写二十条 GRANT 时
+      # 两道防线都通电。硬门恰好会在最需要它的那一刻把总闸拉掉。
+      - name: Prisma generate(typecheck 前置;T3 落地当天自动启用)
+        run: |
+          set -o pipefail
+          schemas=$(git ls-files '*.prisma')
+          if [ -z "$schemas" ]; then
+            echo "树里还没有 .prisma(P0-T3 未落地),本步骤此刻无事可做 —— 但它不是静默跳过。"
+            exit 0
+          fi
+          echo "命中的 schema:"
+          echo "$schemas"
+          pnpm exec prisma generate
+
+      # 走 `pnpm typecheck`(= `pnpm -r typecheck`),与 CLAUDE.md「## 命令」一节、
+      # 与本地敲的完全同源 —— CI 不该有一条本地没有的路径。
+      # 曾经写的是 `tsc -b tsconfig.json`(根上那个 project references 解决方案文件),
+      # 已连同那个文件一起废弃:它的 references 是**手写**的三条,而 `pnpm -r` 的覆盖面
+      # 由 pnpm-workspace.yaml 自动决定。P1-T6 要建的 tools/track-a 不会自己进 references,
+      # 走根 tsconfig 就会被 CI 静默跳过 —— 漂的方向是「CI 绿、本地红」,最坏的那种。
+      # 增量收益一分没丢:`pnpm -r typecheck` 在 core/contracts/server 里跑的同样是
+      # `tsc -b`、命中同样的 .tsbuildinfo(可用 `tsc -b --dry` 自证下一段 build 仍是
+      # up-to-date);apps/web 的 typecheck 是 `tsc --noEmit`,它走 Bundler 解析、由 vite
+      # 编,本来就不在任何 references 里,这条命令顺带把它捎上了。
+      - name: 2/5 typecheck
+        run: pnpm typecheck
+
+      - name: 3/5 build
+        # 与上一段不重复:core/contracts/server 的 dist 与 .tsbuildinfo 上一步已经产出,
+        # 这里三个 `tsc -b` 全部命中增量、直接 up-to-date;真正跑起来的只有 apps/web 的
+        # vite build —— 而它恰恰是原四段漏掉的那块:崩了只会在 T5 的 auto-deploy 里才发现。
+        run: pnpm -r build
+
+      # vitest.config.ts 的 include 是 packages/*/src/**、tools/*/src/**(unit)与
+      # apps/server/src/**/*.integration.test.ts(integration)。也就是说 apps/server 下
+      # 任何**不**叫 `*.integration.test.ts` 的测试,两个 project 一个都不匹配 ——
+      # 而 `--passWithNoTests` 会让「一个都没收到」静默变绿。已经排上日程的撞点:
+      # P4-T1 的契约测试(401/403/404/400/409/429 各一条)、P3-T2 的 webhook 测试。
+      # 今天差集必然为空,零维护成本;那天自动生效。
+      #
+      # `vitest list` 只做收集、**不 import 测试文件**(实测:文件里放 top-level throw
+      # 也照常列出),所以将来那些 import 期就要连库的集成测试不会把这个守卫搞炸。
+      - name: 孤儿测试文件守卫(*.test.ts 落在收集面外 = 静默不跑)
+        run: |
+          set -o pipefail
+          tracked=$(mktemp); collected=$(mktemp)
+          git ls-files '*.test.ts' | sort > "$tracked"
+          # 输出每行形如 `[unit] packages/a/src/one.test.ts`,先剥掉 project 前缀再比对
+          pnpm exec vitest list --filesOnly | sed -E 's/^\[[^]]+\] //' | sort -u > "$collected"
+          orphans=$(comm -23 "$tracked" "$collected")
+          if [ -n "$orphans" ]; then
+            echo "::error file=vitest.config.ts::下列 *.test.ts 不被任何 vitest project 收集,--passWithNoTests 会让它们静默不跑"
+            echo "$orphans"
+            exit 1
+          fi
+          echo "已跟踪的 *.test.ts 共 $(wc -l < "$tracked" | tr -d ' ') 个,全部落在 vitest 收集面内"
+
+      - name: 4/5 unit(golden)
+        run: |
+          # 计数管道必须自己开 pipefail:GitHub 默认 shell 是 `bash -e`,**不带 pipefail**,
+          # `n=$(vitest list | wc -l | tr -d ' ')` 的退出码取自 `tr`,恒为 0 —— vitest 崩了
+          # 也只会得到 n=0 加一条 warning,分辨不出「0 个测试」和「vitest 挂了」
+          # (实测 `--project` 写错会 exit 1,但被管道吞掉)。
+          set -o pipefail
+          pnpm test:unit
+          # test:unit 带着 --passWithNoTests,而 golden tests 要到 P1 才写 —— 这一段现在
+          # 是「空转的绿」。空转可以,静默不行:问 vitest 自己收集到几个测试文件(用它的
+          # list,不另抄一份 include glob,免得两处漂移),0 个就在 PR 上挂一条 warning。
+          # 用 warning 不用 error:今天让它红就是拿一条注定的失败换一句提醒,没人受益。
+          # P1 第一条 golden 落地,这条 warning 自动消失。
+          n=$(pnpm exec vitest list --project unit --filesOnly | wc -l | tr -d ' ')
+          echo "unit 段收集到 $n 个测试文件"
+          [ "$n" -gt 0 ] || echo "::warning file=vitest.config.ts::unit 段收集到 0 个测试文件:这一段目前是空转的绿(golden tests 见 P1)"
+
+      - name: 5/5 integration(compose 起 PG + Redis)
+        id: integration
+        run: |
+          set -o pipefail
+          # --wait 到 healthy 再往下走。healthcheck 带 -h 的理由见 docker-compose.yml:
+          # 不带 -h 会在 initdb 跑完前就报 healthy,而 CI 空卷冷跑正是那个场景。
+          pnpm db:up
+          # 07 §8「append-only 靠权限兜底、不靠纪律」的可执行兑现,和本地是同一份脚本。
+          #
+          # 这一步刻意不 export DATABASE_URL / MIGRATOR_DATABASE_URL / PURGER_DATABASE_URL,
+          # 理由只有一条:`db:verify` 是 `docker compose exec` 在**容器内**执行的,宿主机的
+          # env 带不进去(已实测),给了也没用,脚本会回落到 compose 服务名 postgres。
+          #
+          # 别把这条推广成「连接串不许出现在 CI 里」的通则 —— 它不是。两侧的 pg_hba 命中
+          # 完全不同(2026-08-20 裸协议实测):
+          #   · 宿主机进程连发布出来的 127.0.0.1:5432 —— 经 docker-proxy/DNAT 到达时源地址
+          #     是 bridge 网关(非 loopback),命中 `host all all all scram-sha-256`,
+          #     服务器回 Authentication code 10(SASL/SCRAM),**口令会被真校验**。
+          #     所以 P3/P4 那些跑在宿主机进程里的 integration 测试**应当**直接用
+          #     .env.example 里的 @127.0.0.1 串,那么做是安全的。
+          #   · 容器内走 127.0.0.1 —— 命中 `host all all 127.0.0.1/32 trust`,口令全错也连得上
+          #     (实测 `psql postgresql://app_runtime:TOTALLY_WRONG@127.0.0.1:5432/...` 成功)。
+          #     这才是 db/verify-roles.sh 必须走服务名 `postgres` 的原因,那条约束一个字都不能松。
+          pnpm db:verify
+          pnpm test:integration
+          # 同 unit:integration 的 vitest project 目前也是 0 个文件。差别在于这一段并非
+          # 全空 —— db:verify 的权限断言就是它此刻的实质内容。
+          n=$(pnpm exec vitest list --project integration --filesOnly | wc -l | tr -d ' ')
+          echo "integration 段收集到 $n 个测试文件"
+          [ "$n" -gt 0 ] || echo "::warning file=vitest.config.ts::integration 段收集到 0 个测试文件:本段此刻的实质内容全在 db:verify(见 P0-T3 / P1)"
+
+      # compose 起不来是「本地热跑不复现、CI 空卷冷跑必中」的典型(见 docker-compose.yml
+      # 里 healthcheck 那段)。没有这几行,红了只剩一句 container is unhealthy 可看。
+      # 只在 integration 段自己失败时跑:前面任何一段红都会把它带起来的话,一次 lint 报错
+      # 也要附二百行 compose 日志,而那时 compose 压根没起过。
+      - name: compose 现场(仅 integration 段失败时)
+        if: failure() && steps.integration.outcome == 'failure'
+        run: |
+          # unhealthy 场景下容器状态比 tail 日志更快定位(退出码、重启次数、health 状态)
+          docker compose ps -a
+          docker compose logs --no-color --tail=200
