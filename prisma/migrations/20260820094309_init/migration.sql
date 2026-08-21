@@ -435,13 +435,13 @@ CREATE UNIQUE INDEX "sku_mappings_tenant_id_shopify_listing_id_amazon_listing_id
 CREATE INDEX "inventory_events_tenant_id_product_id_channel_occurred_at_idx" ON "inventory_events"("tenant_id", "product_id", "channel", "occurred_at");
 
 -- CreateIndex
-CREATE UNIQUE INDEX "inventory_events_tenant_id_source_source_ref_key" ON "inventory_events"("tenant_id", "source", "source_ref");
+CREATE UNIQUE INDEX "inventory_events_tenant_id_source_ref_key" ON "inventory_events"("tenant_id", "source_ref");
 
 -- CreateIndex
 CREATE INDEX "sales_events_tenant_id_product_id_channel_occurred_at_idx" ON "sales_events"("tenant_id", "product_id", "channel", "occurred_at");
 
 -- CreateIndex
-CREATE UNIQUE INDEX "sales_events_tenant_id_source_source_ref_key" ON "sales_events"("tenant_id", "source", "source_ref");
+CREATE UNIQUE INDEX "sales_events_tenant_id_source_ref_key" ON "sales_events"("tenant_id", "source_ref");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "stockout_observations_tenant_id_product_id_channel_date_key" ON "stockout_observations"("tenant_id", "product_id", "channel", "date");
