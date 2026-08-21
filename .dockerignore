@@ -1,0 +1,24 @@
+# 构建上下文是仓库根。不排除 node_modules 的话,本机那份(含平台相关二进制)会被
+# 整个塞进上下文,既拖慢上传又可能覆盖镜像里为 linux 装的那份。
+node_modules
+**/node_modules
+
+# 构建产物一律在镜像里重新生成 —— 拷进去只会让「本机构建过一次」冒充构建结果
+dist
+**/dist
+*.tsbuildinfo
+**/*.tsbuildinfo
+apps/server/src/infra/prisma/generated
+
+# 本机机密绝不进镜像(.env.example 是模板,留着)
+.env
+.env.*
+!.env.example
+
+.git
+.github
+specs
+docs
+*.md
+!CLAUDE.md
+.DS_Store
