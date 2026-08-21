@@ -4,7 +4,11 @@
 #
 # syntax=docker/dockerfile:1
 FROM node:22-slim AS base
-ENV PNPM_HOME=/pnpm PATH=$PNPM_HOME:$PATH
+# 两条 ENV 而不是一条:同一条 ENV 内变量还没生效,`PATH=$PNPM_HOME:$PATH` 会拿到空值
+# (BuildKit 会警告 UndefinedVar)。此刻无害——corepack 的 shim 在 /usr/local/bin——
+# 但属于「看着对其实没生效」,不留。
+ENV PNPM_HOME=/pnpm
+ENV PATH=$PNPM_HOME:$PATH
 # openssl 必须装在 **base**、让构建层与运行层探测一致(实测踩过):`prisma migrate`
 # 走 Rust schema engine(运行时 client 才是 rust-free),而 @prisma/engines 在
 # **安装期**按当时探测到的 libssl 下对应变体。只在运行层装 openssl 的话,构建期
