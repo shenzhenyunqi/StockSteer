@@ -253,7 +253,7 @@ export type LedgerEvent = {
   at: { date: string; time: string }
   /** 投递(写入)顺序;06 的乱序用例靠它表达「后到」 */
   deliveredNth: number
-  /** 同一 source_ref 重复投递 —— 期望被 UNIQUE(tenant, source, source_ref) 静默丢弃 */
+  /** 同一 source_ref 重复投递 —— 期望被 UNIQUE(tenant, source_ref) 静默丢弃 */
   duplicateOf?: number
 }
 
@@ -335,7 +335,12 @@ export type SalesCase = {
     sourceRef: string
     /** 非空 = 不计入日桶(02 §1 测试订单;p0 §0 裁决入库 + 标记) */
     excludedReason?: string
-    /** 重复投递(V8 下半句):期望被 UNIQUE 丢弃 */
+    /**
+     * 溯源通道,缺省 shopify_webhook。2026-08-21 键形改 (tenant, source_ref) 后
+     * source 不再参与身份 —— XS 用例靠这个字段从两条通道投同一个 ref。
+     */
+    source?: 'shopify_webhook' | 'shopify_bulk'
+    /** 重复投递(V8 下半句 / XS 跨通道):期望被 UNIQUE 丢弃 */
     duplicate?: boolean
   }[]
 }
@@ -343,11 +348,12 @@ export type SalesCase = {
 export const SALES_CASES: SalesCase[] = [
   {
     // **多 line item 同键**(2026-08-20 复核发现的 BLOCKER 的活体样本)。
-    // 一条 orders/create webhook 带 N 个 line item → N 行 sales_events。原 p3 约定
+    // 一条 orders/create webhook 带 N 个 line item → N 行 sales_events。最初的 p3 约定
     // 把 source_ref 定成 `X-Shopify-Webhook-Id`(**每 webhook 一个值**),于是 N 行同键,
     // 而 01 §1 规定重复投递**静默丢弃** —— 第 2 行起无声消失,速度偏低、卡直接不出。
-    // 这里播的是修正后的约定 `{webhookId}:{lineItemId}`,而且刻意用**同一个 SKU 的
-    // 两个 line item**(最难的那种:给唯一键加 product_id 也救不了)。
+    // 这里播的是现行约定的形(平台记录身份 `shopify:order:{orderId}:{lineItemId}`,
+    // 2026-08-21 键形裁决),而且刻意用**同一个 SKU 的两个 line item**
+    // (最难的那种:给唯一键加 product_id 也救不了)。
     // db/verify-schema.sh 断言这两行都在。
     productId: fixtureId('PRDCT0', 17),
     sku: 'LEDGER-ML-MULTILINE',
@@ -359,14 +365,46 @@ export const SALES_CASES: SalesCase[] = [
         qty: 2,
         occurredAtUtc: '2026-08-12T19:00:00.000Z',
         orderRef: 'ml-order-1',
-        sourceRef: 'seed:wh-ml-1:line-1',
+        sourceRef: 'seed:order:ml-order-1:line-1',
       },
       {
         kind: 'sale',
         qty: 3,
         occurredAtUtc: '2026-08-12T19:00:00.000Z',
         orderRef: 'ml-order-1',
-        sourceRef: 'seed:wh-ml-1:line-2',
+        sourceRef: 'seed:order:ml-order-1:line-2',
+      },
+    ],
+  },
+  {
+    // **XS · 跨通道去重**(2026-08-21 键形裁决 (tenant, source_ref) 的活体探针)。
+    // 同一张订单先经 webhook、再经 bulk 回填到达 —— 平台记录身份让两条投递拼出
+    // **同一个 source_ref**,只有 source 不同。旧键形 (tenant, source, source_ref) 下
+    // 第二条会被**收下**(source 不同不撞键)→ 双计,且 seed.ts 的「重复投递必须
+    // 全部被丢弃」断言当场炸;新键形下它被静默丢弃。这是唯一能区分
+    // 「索引到底换没换」的样本 —— L1 那种同 source 重复在两种键形下都会被丢。
+    // qty 故意不同(2 vs 999):若第二条进了库,日桶断言也立刻看得见。
+    productId: fixtureId('PRDCT0', 20),
+    sku: 'LEDGER-XS-CROSSSOURCE',
+    title: 'XS · 跨通道去重(webhook + bulk 同一平台身份)',
+    expectedBuckets: { '2026-08-11': 2 },
+    orders: [
+      {
+        kind: 'sale',
+        qty: 2,
+        occurredAtUtc: '2026-08-11T19:00:00.000Z',
+        orderRef: 'xs-order-1',
+        sourceRef: 'seed:order:xs-order-1:line-1',
+        source: 'shopify_webhook',
+      },
+      {
+        kind: 'sale',
+        qty: 999,
+        occurredAtUtc: '2026-08-11T19:00:00.000Z',
+        orderRef: 'xs-order-1',
+        sourceRef: 'seed:order:xs-order-1:line-1',
+        source: 'shopify_bulk',
+        duplicate: true,
       },
     ],
   },
@@ -383,14 +421,14 @@ export const SALES_CASES: SalesCase[] = [
         qty: 4,
         occurredAtUtc: '2026-08-13T19:00:00.000Z',
         orderRef: 'real-order-1',
-        sourceRef: 'seed:wh-to-1:line-1',
+        sourceRef: 'seed:order:real-order-1:line-1',
       },
       {
         kind: 'sale',
         qty: 99,
         occurredAtUtc: '2026-08-13T19:00:00.000Z',
         orderRef: 'test-order-1',
-        sourceRef: 'seed:wh-to-2:line-1',
+        sourceRef: 'seed:order:test-order-1:line-1',
         excludedReason: 'test_order',
       },
     ],
@@ -402,31 +440,34 @@ export const SALES_CASES: SalesCase[] = [
     title: 'V7 · 归日时区',
     expectedBuckets: { '2026-08-14': 2 },
     orders: [
-      { kind: 'sale', qty: 2, occurredAtUtc: '2026-08-15T03:00:00.000Z', orderRef: 'v7-1', sourceRef: 'seed:v7:1' },
+      { kind: 'sale', qty: 2, occurredAtUtc: '2026-08-15T03:00:00.000Z', orderRef: 'v7-1', sourceRef: 'seed:order:v7-1:line-1' },
     ],
   },
   {
     // V8 取消反向事件:8/10 下单 3 件,8/16 取消投递 → 追加 cancellation(qty −3,
     // occurred_at = 原下单时间)→ 8/10 桶净 0。重复投递第二次静默丢弃。
+    // 取消 ref = 原单 ref + `:cancelled`(2026-08-21 约定):平台记录身份下取消与原单
+    // 共享 {orderId}:{lineItemId},后缀是把负事件和原单区分开的**唯一**东西 —— 漏了它,
+    // 取消会撞原单的键被静默吞掉,桶里永远是 +3。
     productId: fixtureId('PRDCT0', 16),
     sku: 'LEDGER-V8-CANCELLATION',
     title: 'V8 · 取消反向事件',
     expectedBuckets: { '2026-08-10': 0 },
     orders: [
-      { kind: 'sale', qty: 3, occurredAtUtc: '2026-08-10T19:00:00.000Z', orderRef: 'v8-1', sourceRef: 'seed:v8:sale' },
+      { kind: 'sale', qty: 3, occurredAtUtc: '2026-08-10T19:00:00.000Z', orderRef: 'v8-1', sourceRef: 'seed:order:v8-1:line-1' },
       {
         kind: 'cancellation',
         qty: -3,
         occurredAtUtc: '2026-08-10T19:00:00.000Z',
         orderRef: 'v8-1',
-        sourceRef: 'seed:v8:cancel',
+        sourceRef: 'seed:order:v8-1:line-1:cancelled',
       },
       {
         kind: 'cancellation',
         qty: -3,
         occurredAtUtc: '2026-08-10T19:00:00.000Z',
         orderRef: 'v8-1',
-        sourceRef: 'seed:v8:cancel',
+        sourceRef: 'seed:order:v8-1:line-1:cancelled',
         duplicate: true,
       },
     ],

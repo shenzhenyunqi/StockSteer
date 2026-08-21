@@ -11,7 +11,9 @@
 #   E 外键真的挡住了「删父行连坐事件行」这条绕过权限的路
 #   F recommendation_cards 的 active-slot 部分唯一索引 + 列级 UPDATE
 #   G 种子 fixture 在位、params 默认值 = 06 冻结的 v7.4
-#   H 幂等键的**维度够不够**(一单多 line item / 三态归一 / 同日重复采样)
+#   H 幂等键:**键形对不对**(2026-08-21 起 (tenant, source_ref),source 出键;
+#     结构断言 + 跨通道去重活体样本)与**维度够不够**(一单多 line item / 三态归一
+#     / 同日重复采样)
 #
 # **本脚本要求 migration 已 apply 且种子已跑**(`pnpm db:migrate && pnpm db:seed`)。
 # 缺其一就直接红,不 SKIP —— 与 verify-roles.sh 里那几条自激活断言不同:
@@ -191,7 +193,7 @@ expect_eq "$RUN" \
 expect_eq "$RUN" \
   "select count(*)::text from inventory_events e join products p on p.id=e.product_id
     where p.display_sku='LEDGER-L1-IDEMPOTENT'" \
-  "1" "L1:同 (source, source_ref) 投递两次,库里只有一条"
+  "1" "L1:同 source_ref 投递两次,库里只有一条"
 expect_eq "$RUN" \
   "select count(*)::text from sales_events e join products p on p.id=e.product_id
     where p.display_sku='LEDGER-V8-CANCELLATION'" \
@@ -213,13 +215,37 @@ expect_eq "$RUN" \
   "demo 租户账号健康 = 06 冻结的 IPI 512 / entered Aug 12(G1 归因行要逐字复现它)"
 
 # ---------------------------------------------------------------------------
-echo "· H 幂等键的维度够不够(这一段是 2026-08-20 复核捞出的 BLOCKER 的回归位)"
-# 幂等键是 (tenant, source, source_ref),而 01 §1 规定重复投递**静默丢弃**。
-# 于是「source_ref 少带一个维度」的失败形态不是报错,是**无声少记**,且事件表
-# append-only、少记的行没有重放面。原 spec 有两处踩了这个坑:
+echo "· H 幂等键:键形与维度(2026-08-20 维度 BLOCKER + 2026-08-21 键形裁决的回归位)"
+# 幂等键是 (tenant, source_ref)(2026-08-21 裁决:source 出键,否则同一平台事实经
+# webhook 与 bulk 两条通道到达无法互相去重,回填期间双计)。01 §1 规定重复投递
+# **静默丢弃**,于是「source_ref 少带一个维度」的失败形态不是报错,是**无声少记**,
+# 且事件表 append-only、少记的行没有重放面。2026-08-20 的原 spec 有两处踩了维度坑:
 #   ① p3 的 webhook 约定是整条 webhook 一个 id,而一单 N 个 line item → N 行 sales_events
 #   ② p6 的 snapshot 约定是 {reportId}:{sku},而 01 §3 三态归一 → 一条记录 3 条事件
-# 种子按修正后的约定播了两个活体样本,这里断言它们都进得去。
+# 种子按现行约定播了活体样本,这里断言:键形真的换了(结构 + 行为)、维度都进得去。
+
+# 键形·结构:两张事件表的唯一索引恰是 (tenant_id, source_ref) —— 不含 source
+expect_eq "$MIG" \
+  "select count(*)::text from pg_indexes
+    where schemaname='public' and tablename in ('inventory_events','sales_events')
+      and indexdef like '%UNIQUE%' and indexdef like '%(tenant_id, source_ref)%'" \
+  "2" "幂等键键形 = (tenant_id, source_ref):两张事件表各一条唯一索引,source 不在其中"
+expect_eq "$MIG" \
+  "select count(*)::text from pg_indexes
+    where schemaname='public' and tablename in ('inventory_events','sales_events')
+      and indexdef like '%UNIQUE%' and indexdef like '%source,%'" \
+  "0" "旧键形 (tenant, source, source_ref) 的唯一索引已不存在"
+
+# 键形·行为:XS 样本 —— 同一平台记录身份(同 source_ref)经 webhook 与 bulk 两条
+# 通道投递,库里只有一条。旧键形下 source 不同不撞键,这里会数出 2(且 seed.ts 的
+# 「重复投递必须全部被丢弃」断言在种子阶段就会先炸)。L1 那种同 source 重复在
+# 两种键形下都会被丢,证不了索引换没换 —— 这条才是键形裁决的活体证明。
+expect_eq "$RUN" \
+  "select count(*)::text||'/'||sum(e.qty)::text
+     from sales_events e join products p on p.id=e.product_id
+    where p.display_sku='LEDGER-XS-CROSSSOURCE'" \
+  "1/2" \
+  "XS:跨通道重复投递被丢弃(webhook 那条在、bulk 那条被 UNIQUE 吸收,qty=2 而非 999)"
 expect_eq "$RUN" \
   "select count(*)::text||'/'||count(distinct e.order_ref)::text||'/'||sum(e.qty)::text
      from sales_events e join products p on p.id=e.product_id

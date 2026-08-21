@@ -408,8 +408,12 @@ model InventoryEvent {
   state      InvState
   /// snapshot=绝对值;delta=增减;correction=对账修正后的绝对值(01 §1)
   qty        Int
+  /// 溯源元数据,**不在幂等键里**(2026-08-21 裁决,p0 §0):同一平台事实经 webhook
+  /// 与 bulk 两条通道到达时必须互相去重,source 参与身份就会双计。
   source     Source
-  /// webhook id / report id / 对账 id —— 幂等去重键的一部分
+  /// 全局命名空间化的幂等键(`(tenant, source_ref)` 唯一)。库存 snapshot 取**投递身份**
+  /// (如 `shopify:invwh:{webhookId}:{state}`)—— set-point 跨通道双到达无害,是有意的分类。
+  /// 格式串与身份取法见 plan/p3「source_ref 约定」。
   sourceRef  String   @map("source_ref")
   /// 业务时间。投影按它折叠(L2/L3)
   occurredAt DateTime @map("occurred_at") @db.Timestamptz(3)
@@ -421,11 +425,12 @@ model InventoryEvent {
 
   correctedRows ReconciliationRow[]
 
-  /// L1 幂等:重复投递静默丢弃。store 层 UNIQUE 是第一道(P1-T2 的 fold 是第二道)。
-  /// ⚠ 01 §3 三态归一让**一条平台库存记录产出 3 条事件**(sellable/reserved/inbound),
-  /// 所以 source_ref 必须带 `:{state}`。漏了的话 reserved 与 inbound 永远进不了库,
-  /// 而 inbound 正是 02 §3.1 `gap = … − inbound_dst` 的输入(golden S1)。
-  @@unique([tenantId, source, sourceRef])
+  /// L1/L1b 幂等:重复投递静默丢弃。store 层 UNIQUE 是第一道(P1-T2 的 fold 是第二道)。
+  /// 键形 `(tenant, source_ref)`(2026-08-21 裁决:source 出键,否则 webhook 与 bulk
+  /// 双通道到达无法互相去重)。⚠ 01 §3 三态归一让**一条平台库存记录产出 3 条事件**
+  /// (sellable/reserved/inbound),所以 source_ref 必须带 `:{state}`。漏了的话 reserved
+  /// 与 inbound 永远进不了库,而 inbound 正是 02 §3.1 `gap = … − inbound_dst` 的输入(golden S1)。
+  @@unique([tenantId, sourceRef])
   @@index([tenantId, productId, channel, occurredAt])
   @@map("inventory_events")
 }
@@ -451,7 +456,11 @@ model SalesEvent {
   /// 而 90 天窗口全靠历史行。与「取消」同构(取消也是追加负事件而非删原事件)。
   /// 过滤只发生在 fold → daily_units 这**一个**点上,别在别处再滤一次。
   excludedReason String? @map("excluded_reason")
+  /// 溯源元数据,不在幂等键里(2026-08-21 裁决,同 inventory_events.source)
   source     Source
+  /// 幂等键。sales 取**平台记录身份**(`shopify:order:{orderId}:{lineItemId}`,取消加
+  /// `:cancelled`;`amz:{orderId}:{sku}`)—— webhook 与 bulk 翻译同一张订单拼出同一个 ref,
+  /// 两条通道天然互相去重(R8 全量重跑幂等靠它)。见 plan/p3「source_ref 约定」。
   sourceRef  String    @map("source_ref")
   occurredAt DateTime  @map("occurred_at") @db.Timestamptz(3)
   recordedAt DateTime  @default(now()) @map("recorded_at") @db.Timestamptz(3)
@@ -459,10 +468,12 @@ model SalesEvent {
   tenant  Tenant  @relation(fields: [tenantId], references: [id], onDelete: Restrict, onUpdate: NoAction)
   product Product @relation(fields: [productId], references: [id], onDelete: Restrict, onUpdate: NoAction)
 
-  /// L1 幂等。⚠ `source_ref` 必须对**每一条产出的事件**唯一:一张订单 N 个 line item →
-  /// N 条本表行,source_ref 少带 line item 维度就会被这条键**静默吞掉**后 N−1 条
-  /// (01 §1 规定重复投递静默丢弃,不报错)。约定见 plan/p3「source_ref 约定」。
-  @@unique([tenantId, source, sourceRef])
+  /// L1/L1b 幂等,键形 `(tenant, source_ref)`(2026-08-21 裁决)。⚠ `source_ref` 必须对
+  /// **每一条产出的事件**唯一:一张订单 N 个 line item → N 条本表行,source_ref 少带
+  /// line item 维度就会被这条键**静默吞掉**后 N−1 条(01 §1 规定重复投递静默丢弃,不报错)。
+  /// 取消事件必须带 `:cancelled` 后缀——平台记录身份下取消与原单共享 {orderId}:{lineItemId},
+  /// 不加后缀负事件会撞原单的键被吞。约定见 plan/p3「source_ref 约定」。
+  @@unique([tenantId, sourceRef])
   @@index([tenantId, productId, channel, occurredAt])
   @@map("sales_events")
 }

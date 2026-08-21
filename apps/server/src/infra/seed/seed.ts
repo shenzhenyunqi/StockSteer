@@ -52,7 +52,7 @@ if (!connectionString) {
 
 const prisma = new PrismaClient({ adapter: new PrismaPg({ connectionString }) })
 
-/** 渠道 → 事件来源(03 §4:报告快照 = snapshot 事件,webhook = delta 事件) */
+/** 渠道 → 事件来源(03 §4:demo 的冻结时钟快照走报告/bulk 形——快照类事件的正常来源) */
 const SOURCE_BY_CHANNEL = { DTC: 'shopify_bulk', FBA: 'amazon_report', FBM: 'amazon_report' } as const
 
 type InventoryRow = Prisma.InventoryEventCreateManyInput
@@ -265,7 +265,8 @@ function salesCaseRows(): { real: SalesRow[]; duplicates: SalesRow[] } {
         qty: o.qty,
         orderRef: o.orderRef,
         excludedReason: o.excludedReason ?? null,
-        source: 'shopify_webhook',
+        // XS 用例从两条通道投同一个 source_ref —— source 只是溯源,不参与身份(键形 2026-08-21)
+        source: o.source ?? 'shopify_webhook',
         sourceRef: o.sourceRef,
         occurredAt: new Date(o.occurredAtUtc),
         recordedAt: new Date(o.occurredAtUtc),
@@ -314,6 +315,9 @@ async function main() {
 
   // 重复投递单独发一批,断言 DB 一条都没收 —— 这是 L1 / V8 下半句「第二次静默丢弃」
   // **今天就能验**的那一半(store 层 UNIQUE 是第一道;fold 那道等 P1-T2)。
+  // 其中 XS 那条是**跨通道**重复(同 source_ref、不同 source):旧键形
+  // (tenant, source, source_ref) 会把它收下,这里当场炸 —— 它是「索引真的换成
+  // (tenant, source_ref) 了」的活体证明,L1 那种同 source 重复证不了这一点。
   const dupInv = await prisma.inventoryEvent.createMany({ data: ledger.duplicates, skipDuplicates: true })
   const dupSal = await prisma.salesEvent.createMany({ data: sales.duplicates, skipDuplicates: true })
   const dupStk = await prisma.stockoutObservation.createMany({ data: stockout.duplicates, skipDuplicates: true })

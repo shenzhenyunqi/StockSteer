@@ -55,6 +55,7 @@ pnpm db:down
 > ⑥ **remap 事件无落点**(P6-T5 前)。01 §2「合并 Product 时追加 remap 事件,禁止 UPDATE」,而 `InvKind` 只有 snapshot|delta|correction,也没有 catalog 事件表。T3 spec 的表清单同样漏了。补法是加枚举值或新建一张表,都不属于「事件表补列」那类不可逆操作。
 > ⑦ **`sku_mappings` 要不要「一个 listing 至多一条 confirmed」**(P6-T5 定)。复核建议加部分唯一索引,**暂不加**:没有任何 spec 声明过这条不变量,而商家给同一个 Shopify variant 挂两个 ASIN 是真实存在的形态——加错了会挡住合法数据,比缺一条约束更糟。P6-T5 拿真数据定。
 > ⑧ **`shopify.app.stocksteer.toml` 的 `automatically_update_urls_on_dev` 要在 P0-T5 改成 `false`**。联调期靠它把 tunnel URL 写回 Partner Dashboard;Railway 上线后不改,本地一跑 `shopify app dev` 就会把线上 `application_url` / `redirect_urls` 冲掉,线上安装当场断。文件里留了注释,但注释不会在 P0-T5 那天自己响。
+> ⑨ **测试订单判定的两笔账(P3-T3 实现 ACL 时兑现)**:① `excluded_reason` 在 append-only 表上,写错改不回 —— ACL 判定必须**保守**:平台未明确标 test 的一律 NULL(计入),把错判方向压成看得见的「多计入」(速度略高有人看得见,静默少计没人看得见)。**不加** override 表——那是给还没发生过的错判预付架构费。② 「什么算测试订单」的判定来源:Shopify 取 `order.test`;Amazon 侧是否有等价字段**未核**,P6-T3 前核实并写进 p6。
 
 0. **DB 三身份,权限 fail-closed**。`migrator`(DDL)/ `app_runtime`(运行时)/ `app_purger`(只为 30 天物理删除而生:三张事件表的 SELECT+DELETE,别的一律没有)。
    **fail-closed**:`ALTER DEFAULT PRIVILEGES` 只给 `SELECT, INSERT`,新表天然 append-only;**可变表**要在自己的 migration 里显式 `GRANT UPDATE, DELETE`。漏写的表当场写不动——这是设计,不是 bug。运行时身份 `app_runtime` 永不持有事件表的 UPDATE/DELETE。
@@ -66,7 +67,7 @@ pnpm db:down
 3. **`apps/web` 禁类型断言** —— 接口类型一律从 `packages/contracts` 推断。
 4. **core 除 `acl/` 外禁平台词汇**(fulfillable / available / committed / AFN / MFN)——平台语言不越过反腐层。
 
-**`source_ref` 必须对每一条产出的事件唯一** —— 幂等键 `(tenant, source, source_ref)` 的失败形态是**静默丢弃**(01 §1),所以一条平台记录翻译出 N 条事件时(三态归一 → 3 条;一单 N 个 line item → N 条),少带一个维度的后果是**无声少记**,而事件表 append-only、少记的行没有重放面。约定见 `specs/plan/p3` 的「source_ref 约定」;`db/verify-schema.sh` H 段是它的回归位。append 之后**必须核对写入行数**,少写的进 dead_letters。
+**幂等键 = `(tenant, source_ref)`;`source` 是溯源元数据,不在键里**(2026-08-21 裁决)—— source 参与身份的话,同一平台事实经 webhook 与 bulk 两条通道到达就无法互相去重,回填期间双计。`source_ref` 一律**全局命名空间化**,且必须对每一条产出的事件唯一:幂等键的失败形态是**静默丢弃**(01 §1),一条平台记录翻译出 N 条事件时(三态归一 → 3 条;一单 N 个 line item → N 条),少带一个维度的后果是**无声少记**,而事件表 append-only、少记的行没有重放面。身份取法分两类:**sales 取平台记录身份**(`shopify:order:{orderId}:{lineItemId}`,取消加 `:cancelled` —— 平台身份下取消与原单同前缀,漏了后缀负事件会撞键被吞),**库存 snapshot 取投递身份**(set-point 跨通道双到达无害,聚合观测没有单条平台记录可指——这是有意的分裂,别「统一」它)。约定见 `specs/plan/p3` 的「source_ref 约定」;`db/verify-schema.sh` H 段是回归位(键形结构断言 + 种子 XS 跨通道样本)。append 之后**必须核对写入行数**;少写的行**先按 (tenant, source_ref) 读回比对荷载**——内容相同 = 跨通道良性重复(键形改后是常态,静默),**内容不同才进 dead_letters**(规则与 sales 侧修复路径见 p3 推论;「少写一律进 dead_letters」的旧写法会被回填与全量重跑灌满,别改回去)。Amazon 侧 `amz:{orderId}:{sku}` 的完整性由 ACL **按 (orderId, sku) 聚合**构造——同单同 SKU 多 order item 是官方仓实证的真实形态,而报告侧拿不到可靠的 order-item-id,键里加不了维度(见 p6)。
 
 **外键一律 `Restrict`/`NoAction`,全域无例外** —— 外键级联以被引用表的权限执行,能绕过上面第 0 条把事件行抹掉或改写;权限挡不住,只能在 FK 上堵。写 Prisma model 时必须**每条 `@relation` 都显式写**:v7 对必填关系的默认是 `onUpdate: Cascade`、对可选关系是 `onDelete: SetNull`,不写就默认溜进来。`db/verify-schema.sh` 的 D 段全域反查(附非空转自证)。
 
