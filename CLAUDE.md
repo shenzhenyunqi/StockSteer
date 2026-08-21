@@ -32,7 +32,17 @@ pnpm db:verify        # 权限矩阵 + schema 不变量(两份脚本);改了权�
 pnpm db:roles         # 只重跑角色脚本 —— 任何 prisma reset 之后必须跑(它会 DROP SCHEMA,把默认权限一起带走)
 pnpm db:reset         # down -v 重建卷 + migrate + seed —— 改了 db/roles.sql、口令或 fixture 才走这条
 pnpm db:down
+
+# 镜像(P0-T5,同一镜像双进程;构建上下文是仓库根)
+docker build -f apps/server/Dockerfile -t stocksteer .
+docker run --rm -e DATABASE_URL=... stocksteer                                   # server(默认 CMD)
+docker run --rm -e DATABASE_URL=... stocksteer node apps/server/dist/main.js worker
 ```
+
+> 改 Dockerfile 时两条别踩回去(都会「构建成功、一启动就炸」):**`pnpm prune --prod`
+> 在 workspace 根会把符号链接树剪没**(根只有 devDeps),要用
+> `CI=true pnpm install --frozen-lockfile --prod`;**构建期 `prisma generate` 要喂占位连接串**
+> (`@prisma/config` 的 `env()` 缺变量即抛)。
 
 > **改了种子 fixture 的内容必须 `pnpm db:reset`**:种子对事件表用
 > `ON CONFLICT DO NOTHING`(它只有 INSERT 权限,删不掉旧行),重跑是 no-op,旧值会留着。
@@ -70,6 +80,8 @@ pnpm db:down
 **幂等键 = `(tenant, source_ref)`;`source` 是溯源元数据,不在键里**(2026-08-21 裁决)—— source 参与身份的话,同一平台事实经 webhook 与 bulk 两条通道到达就无法互相去重,回填期间双计。`source_ref` 一律**全局命名空间化**,且必须对每一条产出的事件唯一:幂等键的失败形态是**静默丢弃**(01 §1),一条平台记录翻译出 N 条事件时(三态归一 → 3 条;一单 N 个 line item → N 条),少带一个维度的后果是**无声少记**,而事件表 append-only、少记的行没有重放面。身份取法分两类:**sales 取平台记录身份**(`shopify:order:{orderId}:{lineItemId}`,取消加 `:cancelled` —— 平台身份下取消与原单同前缀,漏了后缀负事件会撞键被吞),**库存 snapshot 取投递身份**(set-point 跨通道双到达无害,聚合观测没有单条平台记录可指——这是有意的分裂,别「统一」它)。约定见 `specs/plan/p3` 的「source_ref 约定」;`db/verify-schema.sh` H 段是回归位(键形结构断言 + 种子 XS 跨通道样本)。append 之后**必须核对写入行数**;少写的行**先按 (tenant, source_ref) 读回比对荷载**——内容相同 = 跨通道良性重复(键形改后是常态,静默),**内容不同才进 dead_letters**(规则与 sales 侧修复路径见 p3 推论;「少写一律进 dead_letters」的旧写法会被回填与全量重跑灌满,别改回去)。Amazon 侧 `amz:{orderId}:{sku}` 的完整性由 ACL **按 (orderId, sku) 聚合**构造——同单同 SKU 多 order item 是官方仓实证的真实形态,而报告侧拿不到可靠的 order-item-id,键里加不了维度(见 p6)。
 
 **外键一律 `Restrict`/`NoAction`,全域无例外** —— 外键级联以被引用表的权限执行,能绕过上面第 0 条把事件行抹掉或改写;权限挡不住,只能在 FK 上堵。写 Prisma model 时必须**每条 `@relation` 都显式写**:v7 对必填关系的默认是 `onUpdate: Cascade`、对可选关系是 `onDelete: SetNull`,不写就默认溜进来。`db/verify-schema.sh` 的 D 段全域反查(附非空转自证)。
+
+**生产权限自检随镜像走,不靠人手工跑**(P0-T5 裁决)。`apps/server/src/infra/db/assert-runtime-identity.ts` 在 `main.ts` 分派 server/worker **之前**执行,查三条:运行时身份非超级用户(Railway 注入的 `DATABASE_URL` 就是超级用户串,用了它 append-only 兜底当场归零)、三张事件表无 UPDATE/DELETE/**TRUNCATE**、public 下表 owner 均为 migrator。不过则拒绝启动。别把它挪进 `/healthz`——健康检查只报进程活着,不做级联判定,否则一次库抖动会被放大成停服。
 
 大文件一律流式,整文件读进内存 = review 打回。
 
