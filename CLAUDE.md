@@ -39,10 +39,16 @@ docker run --rm -e DATABASE_URL=... stocksteer                                  
 docker run --rm -e DATABASE_URL=... stocksteer node apps/server/dist/main.js worker
 ```
 
-> 改 Dockerfile 时两条别踩回去(都会「构建成功、一启动就炸」):**`pnpm prune --prod`
-> 在 workspace 根会把符号链接树剪没**(根只有 devDeps),要用
-> `CI=true pnpm install --frozen-lockfile --prod`;**构建期 `prisma generate` 要喂占位连接串**
-> (`@prisma/config` 的 `env()` 缺变量即抛)。
+> 改 Dockerfile 时五条别踩回去(全都「构建成功、一启动/一部署就炸」,而且 **CI 一条都拦不住**
+> —— CI 跑 compose 与源码树,不跑镜像):
+> ① **`pnpm prune --prod` 在 workspace 根会把符号链接树剪没**(根只有 devDeps)→
+> 用 `CI=true pnpm install --frozen-lockfile --prod`;
+> ② **构建期 `prisma generate` 要喂占位连接串**(`@prisma/config` 的 `env()` 缺变量即抛);
+> ③ **`prisma` / `dotenv` 是生产依赖**(preDeploy 的 migrate 在这个镜像里跑,`--prod` 会剪掉 devDeps);
+> ④ **preDeploy 用 `./node_modules/.bin/prisma`,别用 `pnpm exec`**(USER node 撞 corepack 下载权限,`spawn prisma EACCES`);
+> ⑤ **openssl 装在 base 层**,让构建层与运行层探测一致 —— `migrate` 走 Rust schema engine,
+> 引擎变体在**安装期**按 libssl 探测结果下载;只在运行层装会下错变体、运行时想现下、写不动。
+> 连带:prod install **不能加 `--ignore-scripts`**(否则引擎压根不下载)。
 
 > **改了种子 fixture 的内容必须 `pnpm db:reset`**:种子对事件表用
 > `ON CONFLICT DO NOTHING`(它只有 INSERT 权限,删不掉旧行),重跑是 no-op,旧值会留着。

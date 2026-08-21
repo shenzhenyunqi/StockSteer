@@ -5,6 +5,14 @@
 # syntax=docker/dockerfile:1
 FROM node:22-slim AS base
 ENV PNPM_HOME=/pnpm PATH=$PNPM_HOME:$PATH
+# openssl 必须装在 **base**、让构建层与运行层探测一致(实测踩过):`prisma migrate`
+# 走 Rust schema engine(运行时 client 才是 rust-free),而 @prisma/engines 在
+# **安装期**按当时探测到的 libssl 下对应变体。只在运行层装 openssl 的话,构建期
+# 探测不到会下 openssl-1.1.x,运行期却探测到 3.0.x → 想现下 → USER node 写不动
+# root 的 node_modules → "Can't write to .../@prisma/engines"。
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends openssl \
+ && rm -rf /var/lib/apt/lists/*
 RUN corepack enable
 WORKDIR /app
 
@@ -34,13 +42,15 @@ RUN pnpm -r build
 # devDependencies —— 结果是 node_modules 被剪成 0、workspace 包的符号链接一起没了,
 # 镜像能构建成功但一启动就 ERR_MODULE_NOT_FOUND(实测)。`install --prod` 才会
 # 重建符号链接树、只留生产依赖。
-RUN CI=true pnpm install --frozen-lockfile --prod --ignore-scripts
+# **不能加 `--ignore-scripts`**:它会跳过 `@prisma/engines` 的 postinstall(下载
+# schema engine 二进制),于是 `migrate deploy` 在运行时才去下,而运行层是 USER node、
+# 写不了 root 拥有的 node_modules —— 报 "Can't write to .../@prisma/engines"(实测)。
+# 放行名单已在 pnpm-workspace.yaml 的 onlyBuiltDependencies 里。
+RUN CI=true pnpm install --frozen-lockfile --prod
 
 # ── 运行层 ───────────────────────────────────────────────────────────────────
 FROM base AS runtime
 ENV NODE_ENV=production
-# 生成的 client 走 @prisma/adapter-pg → node-postgres,**没有 rust engine 二进制**
-# (provider = "prisma-client"),所以运行层不需要 openssl 之类的额外系统库。
 COPY --from=build /app /app
 USER node
 EXPOSE 8080
