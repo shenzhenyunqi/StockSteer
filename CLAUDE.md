@@ -70,7 +70,7 @@ docker run --rm -e DATABASE_URL=... stocksteer node apps/server/dist/main.js wor
 > ⑤ **`reconciliation_rows` 缺 channel/state**(P3-T6 前)。correction 事件必须带 `(channel, state, qty)`,而行里没有 channel,超带裁决时造不出来;更实的风险是一个双挂牌 Product 的 DTC +50 / FBA −50 会合并成 delta 0 判成 Match,两个渠道都错。**故意留到 P3-T6**:行的粒度取决于拍板 1(对账超带裁决形态,≈9/1 才定),现在猜一个粒度比缺一个更难改。可变表。
 > ⑥ **remap 事件无落点**(P6-T5 前)。01 §2「合并 Product 时追加 remap 事件,禁止 UPDATE」,而 `InvKind` 只有 snapshot|delta|correction,也没有 catalog 事件表。T3 spec 的表清单同样漏了。补法是加枚举值或新建一张表,都不属于「事件表补列」那类不可逆操作。
 > ⑦ **`sku_mappings` 要不要「一个 listing 至多一条 confirmed」**(P6-T5 定)。复核建议加部分唯一索引,**暂不加**:没有任何 spec 声明过这条不变量,而商家给同一个 Shopify variant 挂两个 ASIN 是真实存在的形态——加错了会挡住合法数据,比缺一条约束更糟。P6-T5 拿真数据定。
-> ⑧ **`shopify.app.stocksteer.toml` 的 `automatically_update_urls_on_dev` 要在 P0-T5 改成 `false`**。联调期靠它把 tunnel URL 写回 Partner Dashboard;Railway 上线后不改,本地一跑 `shopify app dev` 就会把线上 `application_url` / `redirect_urls` 冲掉,线上安装当场断。文件里留了注释,但注释不会在 P0-T5 那天自己响。
+> ⑧ **已还(2026-08-21)**:`shopify.app.stocksteer.toml` 的 `automatically_update_urls_on_dev` 已改 `false`(约定期限就是 P0-T5)。它为 `true` 时本地一跑 `shopify app dev` 就会把线上 `application_url` / `redirect_urls` 冲掉,线上安装当场断——P3 联调要 tunnel 回写时临时翻开,用完当场翻回。
 > ⑩ **Railway Redis 口令要在真数据落地前轮换**(2026-08-21 P0-T5 搭环境时泄漏进对话记录,当时判断「反正是测试环境」而未换)。**期限:W12 切换前**——那个 environment 就叫 `production`,切换那天它就是真生产,口令还是同一个。换法无包袱(Redis 无 initdb 持久化):服务 → Variables → 改 `REDIS_PASSWORD` → 重新部署,再同步两个 app 服务的 `REDIS_URL`。同批泄漏的 Postgres 超级用户口令已在当天换掉。
 > ⑨ **测试订单判定的两笔账(P3-T3 实现 ACL 时兑现)**:① `excluded_reason` 在 append-only 表上,写错改不回 —— ACL 判定必须**保守**:平台未明确标 test 的一律 NULL(计入),把错判方向压成看得见的「多计入」(速度略高有人看得见,静默少计没人看得见)。**不加** override 表——那是给还没发生过的错判预付架构费。② 「什么算测试订单」的判定来源:Shopify 取 `order.test`;Amazon 侧是否有等价字段**未核**,P6-T3 前核实并写进 p6。
 

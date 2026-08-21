@@ -6,9 +6,10 @@ application_url = "https://stocksteer-app.maxvideohub.com"
 embedded = false
 
 [build]
-# 联调期用 tunnel URL 覆盖上面的 application_url / redirect_urls。
-# P0-T5 Railway 上线后改为 false,否则本地一跑 dev 就把线上 App URL 冲掉。
-automatically_update_urls_on_dev = true
+# 2026-08-21 改 false(P0-T5 已上线,还欠账⑧):true 时本地一跑 shopify app dev
+# 就会把线上 application_url / redirect_urls 冲掉,线上安装当场断。
+# P3 联调需要 tunnel 回写时临时翻开,用完当场翻回。
+automatically_update_urls_on_dev = false
 
 [webhooks]
 api_version = "2026-07"
